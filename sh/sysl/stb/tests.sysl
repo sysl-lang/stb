@@ -1,0 +1,445 @@
+module sh.sysl.stb
+@tests
+
+import sh.sysl.stb.c
+
+// The binding's own tests, run with `sysl test .`.
+//
+// ==The four fixtures are an ORACLE, and that is what makes this suite worth having==
+//
+// A decoder tested only against its own encoder proves that the two agree, which they would even if
+// both were wrong about the format. So the four images below were **not** made by stb. Their twelve
+// pixels were chosen here, written out as a raw PPM, and encoded by **ImageMagick** — a different
+// implementation of all four formats, by different people. A test that decodes one and compares
+// against `expected()` is therefore checking stb against somebody else's idea of what a PNG is.
+//
+// It has already earned its place: ImageMagick wrote the PNG as a **4-bit palette** image rather
+// than the 8-bit truecolour one a round trip would have produced, so the indexed path through
+// stb's PNG decoder is covered by accident of using a real encoder — and would not have been
+// covered at all by a fixture this package made itself.
+//
+// The image is 4 x 3 and its pixels are deliberately awkward: pure red, green and blue, white,
+// black, and seven arbitrary mixtures. Nothing is a flat fill, so a decoder that dropped a row or
+// transposed the image fails rather than passing on symmetry.
+
+
+// ## Reading
+
+@test("probe reads the shape of a PNG without decoding it")
+probe_png()
+    val f = fixture_png()
+    val shape = probe(f[0..<f.len]).unwrap()
+
+    assert_eq(shape.width, 4, "width")
+    assert_eq(shape.height, 3, "height")
+
+@test("a PNG ImageMagick wrote decodes to the pixels it was given")
+decode_png()
+    val f = fixture_png()
+    val img = decode(f[0..<f.len], Channels.Rgb).unwrap()
+
+    assert_eq(img.width, 4, "width")
+    assert_eq(img.height, 3, "height")
+    assert_eq(img.channels, 3, "three channels were asked for")
+    same_pixels(img.pixels(), "PNG")
+
+@test("a BMP ImageMagick wrote decodes to the same pixels")
+decode_bmp()
+    val f = fixture_bmp()
+    val img = decode(f[0..<f.len], Channels.Rgb).unwrap()
+
+    assert_eq(img.width, 4, "width")
+    assert_eq(img.height, 3, "height")
+    same_pixels(img.pixels(), "BMP")
+
+@test("a TGA ImageMagick wrote decodes to the same pixels")
+decode_tga()
+    val f = fixture_tga()
+    val img = decode(f[0..<f.len], Channels.Rgb).unwrap()
+
+    assert_eq(img.width, 4, "width")
+    assert_eq(img.height, 3, "height")
+    same_pixels(img.pixels(), "TGA")
+
+// JPEG is lossy, so the pixels are compared with a tolerance rather than exactly. The tolerance is
+// what a quality-95 encode of twelve wildly different pixels costs: sharp edges between saturated
+// colours are the worst case for chroma subsampling, and this image is nothing but those.
+@test("a JPEG ImageMagick wrote decodes to approximately the same pixels")
+decode_jpg()
+    val f = fixture_jpg()
+    val img = decode(f[0..<f.len], Channels.Rgb).unwrap()
+
+    assert_eq(img.width, 4, "width")
+    assert_eq(img.height, 3, "height")
+
+    val want = expected()
+    val got = img.pixels()
+    var worst = 0
+
+    for i in 0..<want.len
+        val d = if int(got[i]) > int(want[i]) then int(got[i]) - int(want[i]) else int(want[i]) - int(got[i])
+
+        if d > worst then worst = d
+
+    assert(worst <= 96, f"the worst channel is off by ${worst}%d, which is more than a lossy encode of this image should cost")
+
+@test("asking for four channels adds an opaque alpha and leaves the colour alone")
+decode_as_rgba()
+    val f = fixture_png()
+    val img = decode(f[0..<f.len], Channels.Rgba).unwrap()
+
+    assert_eq(img.channels, 4, "four channels came back")
+    assert_eq(img.source_channels, 3, "the file itself held three")
+
+    val want = expected()
+    val got = img.pixels()
+
+    for i in 0..<12
+        assert_eq(got[i * 4 + 0], want[i * 3 + 0], "red")
+        assert_eq(got[i * 4 + 1], want[i * 3 + 1], "green")
+        assert_eq(got[i * 4 + 2], want[i * 3 + 2], "blue")
+        assert_eq(got[i * 4 + 3], u8(255), "alpha is opaque")
+
+@test("neither fixture claims a depth it does not have")
+depth_probes()
+    val f = fixture_png()
+
+    assert(!is_16_bit(f[0..<f.len]), "an 8-bit PNG is not 16-bit")
+    assert(!is_hdr(f[0..<f.len]), "a PNG is not a Radiance image")
+
+// ## Refusing
+
+@test("bytes that are no image at all are refused, and stb says why")
+refuse_garbage()
+    var junk: [16]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+    decode(junk[0..<junk.len]) match
+        Ok(_)             -> assert(false, "sixteen arbitrary bytes are not an image")
+        Err(Refused(why)) -> assert(why.len > 0, "stb left a reason")
+        Err(other)        -> assert(false, f"the wrong error: ${other}%s")
+
+// **stb tolerates exactly four bytes off the end of a PNG and no more**, which was measured rather
+// than assumed -- cuts of one through four decode and a cut of five is refused. Four is the length
+// of the IEND chunk's CRC, so what this records is that stb does not verify it: once the last IDAT
+// has been inflated the image is complete, and the trailer is read for its type rather than checked.
+//
+// It is pinned here because it is a real property somebody will meet -- a file truncated in transit
+// by a few bytes decodes, silently -- and because it is the kind of thing an upstream tightening
+// would change without saying so.
+@test("stb reads a PNG whose IEND checksum was cut off, and refuses one cut any deeper")
+truncation_tolerance()
+    val f = fixture_png()
+
+    for cut in 1..<5
+        assert(decode(f[0..<(f.len - usize(cut))]).is_ok(),
+               f"${cut}%d bytes off the end is still inside the IEND checksum, which stb does not verify")
+
+    for cut in 5..<12
+        assert(decode(f[0..<(f.len - usize(cut))]).is_err(),
+               f"${cut}%d bytes off the end cuts into the chunk itself and must be refused")
+
+@test("a probe of garbage fails as a decode of it would")
+refuse_probe()
+    var junk: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+
+    assert(probe(junk[0..<junk.len]).is_err(), "eight zero bytes are not an image")
+
+// ## Writing
+
+@test("a PNG this package writes decodes back to exactly what went in")
+round_trip_png()
+    val want = expected()
+    val png = encode_png(want[0..<want.len], 4, 3, 3).unwrap()
+
+    assert(png.len() > 0, "something was written")
+
+    val back = decode(png.bytes(), Channels.Rgb).unwrap()
+
+    assert_eq(back.width, 4, "width survived")
+    assert_eq(back.height, 3, "height survived")
+    same_pixels(back.pixels(), "the PNG this package wrote")
+
+// **This test reads the file format rather than trusting the decoder**, which is the point of it:
+// a round trip through stb's own reader would pass even if the writer emitted something only stb
+// understands. These are the bytes the PNG specification requires, checked by hand.
+@test("what encode_png writes is a PNG by the specification, not merely by stb's reader")
+png_is_a_png()
+    val want = expected()
+    val png = encode_png(want[0..<want.len], 4, 3, 3).unwrap()
+    val b = png.bytes()
+
+    assert(b.len > 33, "a PNG is at least a signature and an IHDR")
+
+    // The eight-byte signature, which is what every reader identifies the format by.
+    assert_eq(b[0], u8(137), "high bit set, so a text-mode transfer corrupts it detectably")
+    assert_eq(b[1], u8(80), "P")
+    assert_eq(b[2], u8(78), "N")
+    assert_eq(b[3], u8(71), "G")
+    assert_eq(b[4], u8(13), "CR")
+    assert_eq(b[5], u8(10), "LF")
+    assert_eq(b[6], u8(26), "an MS-DOS end of file")
+    assert_eq(b[7], u8(10), "LF again, so a CRLF translation shows up")
+
+    // The IHDR chunk: a four-byte length of 13, the type, then the header itself.
+    assert_eq(b[8], u8(0), "IHDR length, byte 0")
+    assert_eq(b[9], u8(0), "IHDR length, byte 1")
+    assert_eq(b[10], u8(0), "IHDR length, byte 2")
+    assert_eq(b[11], u8(13), "an IHDR is thirteen bytes")
+    assert_eq(b[12], u8(73), "I")
+    assert_eq(b[13], u8(72), "H")
+    assert_eq(b[14], u8(68), "D")
+    assert_eq(b[15], u8(82), "R")
+
+    // Width and height, big-endian, which is the one place a byte order mistake would show.
+    assert_eq(be32(b, 16), 4, "the width in the header")
+    assert_eq(be32(b, 20), 3, "the height in the header")
+
+    assert_eq(b[24], u8(8), "eight bits a channel")
+    assert_eq(b[25], u8(2), "colour type 2 is truecolour without alpha, which is what three channels are")
+
+@test("a BMP this package writes decodes back to what went in")
+round_trip_bmp()
+    val want = expected()
+    val bmp = encode_bmp(want[0..<want.len], 4, 3, 3).unwrap()
+    val back = decode(bmp.bytes(), Channels.Rgb).unwrap()
+
+    assert_eq(back.width, 4, "width survived")
+    same_pixels(back.pixels(), "the BMP this package wrote")
+
+@test("a TGA this package writes decodes back to what went in")
+round_trip_tga()
+    val want = expected()
+    val tga = encode_tga(want[0..<want.len], 4, 3, 3).unwrap()
+    val back = decode(tga.bytes(), Channels.Rgb).unwrap()
+
+    assert_eq(back.width, 4, "width survived")
+    same_pixels(back.pixels(), "the TGA this package wrote")
+
+@test("a JPEG this package writes is a JPEG of the right shape")
+round_trip_jpg()
+    val want = expected()
+    val jpg = encode_jpg(want[0..<want.len], 4, 3, 3, 90).unwrap()
+    val b = jpg.bytes()
+
+    assert_eq(b[0], u8(255), "the start-of-image marker")
+    assert_eq(b[1], u8(216), "which is FF D8")
+
+    val back = decode(b, Channels.Rgb).unwrap()
+
+    assert_eq(back.width, 4, "width survived")
+    assert_eq(back.height, 3, "height survived")
+
+@test("quality changes how big a JPEG comes out")
+jpeg_quality()
+    val want = expected()
+    val low = encode_jpg(want[0..<want.len], 4, 3, 3, 10).unwrap()
+    val high = encode_jpg(want[0..<want.len], 4, 3, 3, 100).unwrap()
+
+    assert(high.len() > low.len(), f"quality 100 (${high.len()}%d bytes) should be larger than quality 10 (${low.len()}%d)")
+
+@test("pixels that do not fill the shape they were given are refused before C reads them")
+short_pixels()
+    var few: [6]u8 = [1, 2, 3, 4, 5, 6]
+
+    encode_png(few[0..<few.len], 4, 3, 3) match
+        Err(Shape(needed)) -> assert_eq(needed, 36usize, "four by three by three is thirty-six")
+        Ok(_)              -> assert(false, "six bytes are not a four by three RGB image")
+        Err(other)         -> assert(false, f"the wrong error: ${other}%s")
+
+// ## Scaling
+
+@test("a solid colour survives being scaled down")
+resize_solid()
+    var src: [64]u8 = [0; 64]
+
+    for i in 0..<16
+        src[i * 4 + 0] = 200
+        src[i * 4 + 1] = 100
+        src[i * 4 + 2] = 50
+        src[i * 4 + 3] = 255
+
+    var dst: [16]u8 = [0; 16]
+
+    resize(src[0..<src.len], 4, 4, dst[0..<dst.len], 2, 2, Layout.Rgba).unwrap()
+
+    for i in 0..<4
+        assert_eq(dst[i * 4 + 0], u8(200), "red is unchanged by averaging equals")
+        assert_eq(dst[i * 4 + 1], u8(100), "green")
+        assert_eq(dst[i * 4 + 2], u8(50), "blue")
+        assert_eq(dst[i * 4 + 3], u8(255), "alpha")
+
+@test("scaling up puts something in every output pixel")
+resize_up()
+    val want = expected()
+    var dst: [192]u8 = [0; 192]
+
+    resize(want[0..<want.len], 4, 3, dst[0..<dst.len], 8, 8, Layout.Rgb).unwrap()
+
+    var nonzero = 0
+
+    for i in 0..<dst.len
+        if dst[i] != 0 then nonzero += 1
+
+    assert(nonzero > 100, f"only ${nonzero}%d of 192 output bytes were written")
+
+@test("an output slice too small for the size asked for is refused")
+resize_short_output()
+    val want = expected()
+    var dst: [4]u8 = [0, 0, 0, 0]
+
+    resize(want[0..<want.len], 4, 3, dst[0..<dst.len], 2, 2, Layout.Rgb) match
+        Err(Shape(needed)) -> assert_eq(needed, 12usize, "two by two by three")
+        Ok(_)              -> assert(false, "four bytes cannot hold a two by two RGB image")
+        Err(other)         -> assert(false, f"the wrong error: ${other}%s")
+
+// **A layout is not a channel count**, and this is the test that says so. `Bgr` is 0 and
+// `FourChannel` is 5 in stb's enumeration, so a binding that passed the channel count where a
+// layout was wanted would be wrong for both.
+@test("a layout names a channel order, and its number is not the channel count")
+layout_numbers()
+    assert_eq(Layout.Bgr.code(), 0, "STBIR_BGR is zero")
+    assert_eq(Layout.Rgb.code(), 3, "STBIR_RGB happens to be three")
+    assert_eq(Layout.FourChannel.code(), 5, "STBIR_4CHANNEL is five, not four")
+    assert_eq(Layout.Rgba.code(), 4, "STBIR_RGBA is four")
+
+    assert_eq(Layout.Grey.channels(), 1usize, "one byte a pixel")
+    assert_eq(Layout.GreyAlpha.channels(), 2usize, "two")
+    assert_eq(Layout.Bgr.channels(), 3usize, "three, whatever its code says")
+    assert_eq(Layout.FourChannel.channels(), 4usize, "four, whatever its code says")
+    assert_eq(Layout.ArgbPremultiplied.channels(), 4usize, "four")
+
+// ## Floating point
+
+// **Reading only.** There is no `encode_hdr` -- `stb.sysl` says why -- so this is checked against
+// ImageMagick's Radiance encoding of the same twelve pixels rather than against a round trip, which
+// is the better oracle anyway.
+@test("a Radiance image ImageMagick wrote decodes to the same light")
+decode_hdr()
+    val f = fixture_hdr()
+
+    assert(is_hdr(f[0..<f.len]), "the fixture is a Radiance image")
+
+    val img = decode_f(f[0..<f.len], Channels.Rgb).unwrap()
+
+    assert_eq(img.width, 4, "width")
+    assert_eq(img.height, 3, "height")
+
+    // Radiance stores eight bits a channel against a shared exponent, and the pixels went in as
+    // sRGB bytes, so what comes back is the same colours in linear light rather than the same
+    // numbers. What is checked is the relation the encoding must preserve: a channel that was
+    // brighter than another still is, and pure red is still red.
+    // The first four pixels are pure red, green, blue and white, and Radiance's shared-exponent
+    // encoding carries those **exactly** -- measured, not hoped for. That makes this a much sharper
+    // test than an ordering check: a decoder that mixed up the exponent, or read the channels in
+    // the wrong order, cannot land on 1.0 and 0.0 by accident.
+    val v = img.pixels()
+    val want: [12]f32 = [1.0, 0.0, 0.0,
+                         0.0, 1.0, 0.0,
+                         0.0, 0.0, 1.0,
+                         1.0, 1.0, 1.0]
+
+    for i in 0..<12
+        assert_eq(v[i], want[i], f"channel ${i}%d of the first four pixels")
+
+// ## Helpers
+
+// The oracle's own pixels, which every decode is checked against.
+private same_pixels(got: []const u8, what: string)
+    val want = expected()
+
+    assert_eq(got.len, want.len, f"${what}%s decoded to the right number of bytes")
+
+    for i in 0..<want.len
+        assert_eq(got[i], want[i], f"${what}%s, byte ${i}%d")
+
+// A big-endian 32-bit number out of a byte slice, which is how every length and dimension in a PNG
+// is written. Here rather than in the binding because reading PNG chunks is not this package's job
+// — it is this test's, for the one test whose subject is the file format itself.
+private be32(b: []const u8, at: usize) -> int =
+    int(b[at]) * 16777216 + int(b[at + 1]) * 65536 + int(b[at + 2]) * 256 + int(b[at + 3])
+
+private expected() -> [36]u8 =
+    [
+        255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 128, 64, 32, 10, 20,
+        30, 200, 100, 50, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204
+    ]
+
+private fixture_png() -> [348]u8 =
+    [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 4,
+        0, 0, 0, 3, 4, 3, 0, 0, 0, 70, 218, 179, 245, 0, 0, 0, 32, 99, 72, 82,
+        77, 0, 0, 122, 38, 0, 0, 128, 132, 0, 0, 250, 0, 0, 0, 128, 232, 0, 0, 117,
+        48, 0, 0, 234, 96, 0, 0, 58, 152, 0, 0, 23, 112, 156, 186, 81, 60, 0, 0, 0,
+        36, 80, 76, 84, 69, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0,
+        128, 64, 32, 10, 20, 30, 200, 100, 50, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187,
+        204, 56, 44, 185, 159, 0, 0, 0, 1, 98, 75, 71, 68, 3, 17, 12, 76, 242, 0, 0,
+        0, 7, 116, 73, 77, 69, 7, 234, 9, 5, 1, 23, 12, 76, 50, 162, 141, 0, 0, 0,
+        37, 116, 69, 88, 116, 100, 97, 116, 101, 58, 99, 114, 101, 97, 116, 101, 0, 50, 48, 50,
+        54, 45, 48, 57, 45, 48, 53, 84, 48, 49, 58, 50, 51, 58, 49, 50, 43, 48, 48, 58,
+        48, 48, 239, 143, 182, 73, 0, 0, 0, 37, 116, 69, 88, 116, 100, 97, 116, 101, 58, 109,
+        111, 100, 105, 102, 121, 0, 50, 48, 50, 54, 45, 48, 57, 45, 48, 53, 84, 48, 49, 58,
+        50, 51, 58, 49, 50, 43, 48, 48, 58, 48, 48, 158, 210, 14, 245, 0, 0, 0, 40, 116,
+        69, 88, 116, 100, 97, 116, 101, 58, 116, 105, 109, 101, 115, 116, 97, 109, 112, 0, 50, 48,
+        50, 54, 45, 48, 57, 45, 48, 53, 84, 48, 49, 58, 50, 51, 58, 49, 50, 43, 48, 48,
+        58, 48, 48, 201, 199, 47, 42, 0, 0, 0, 17, 73, 68, 65, 84, 8, 215, 99, 96, 84,
+        102, 112, 77, 103, 232, 92, 13, 0, 5, 184, 2, 5, 52, 78, 45, 196, 0, 0, 0, 0,
+        73, 69, 78, 68, 174, 66, 96, 130
+    ]
+
+private fixture_bmp() -> [174]u8 =
+    [
+        66, 77, 174, 0, 0, 0, 0, 0, 0, 0, 138, 0, 0, 0, 124, 0, 0, 0, 4, 0,
+        0, 0, 3, 0, 0, 0, 1, 0, 24, 0, 0, 0, 0, 0, 36, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255,
+        0, 0, 255, 0, 0, 0, 0, 0, 0, 255, 66, 71, 82, 115, 143, 194, 245, 40, 81, 184,
+        30, 21, 30, 133, 235, 1, 51, 51, 51, 19, 102, 102, 102, 38, 102, 102, 102, 6, 153, 153,
+        153, 9, 61, 10, 215, 3, 40, 92, 143, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 51, 34,
+        17, 102, 85, 68, 153, 136, 119, 204, 187, 170, 0, 0, 0, 32, 64, 128, 30, 20, 10, 50,
+        100, 200, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255
+    ]
+
+private fixture_tga() -> [54]u8 =
+    [
+        0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 3, 0, 24, 32, 0, 0,
+        255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 0, 0, 0, 32, 64, 128, 30, 20, 10, 50,
+        100, 200, 51, 34, 17, 102, 85, 68, 153, 136, 119, 204, 187, 170
+    ]
+
+private fixture_jpg() -> [411]u8 =
+    [
+        255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0,
+        255, 219, 0, 67, 0, 2, 1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 2, 2, 2, 2,
+        4, 3, 2, 2, 2, 2, 5, 4, 4, 3, 4, 6, 5, 6, 6, 6, 5, 6, 6, 6,
+        7, 9, 8, 6, 7, 9, 7, 6, 6, 8, 11, 8, 9, 10, 10, 10, 10, 10, 6, 8,
+        11, 12, 11, 10, 12, 9, 10, 10, 10, 255, 219, 0, 67, 1, 2, 2, 2, 2, 2, 2,
+        5, 3, 3, 5, 10, 7, 6, 7, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+        10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+        10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 255, 192,
+        0, 17, 8, 0, 3, 0, 4, 3, 1, 17, 0, 2, 17, 1, 3, 17, 1, 255, 196, 0,
+        20, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 255,
+        196, 0, 30, 16, 0, 1, 4, 2, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        4, 1, 2, 3, 5, 6, 17, 0, 7, 8, 9, 255, 196, 0, 21, 1, 1, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 5, 255, 196, 0, 31, 17, 1,
+        1, 1, 0, 1, 3, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 1, 4, 5,
+        17, 18, 0, 6, 19, 33, 49, 255, 218, 0, 12, 3, 1, 0, 2, 17, 3, 17, 0, 63,
+        0, 66, 248, 250, 203, 218, 175, 23, 213, 92, 211, 118, 46, 102, 9, 23, 37, 180, 171, 87,
+        129, 156, 218, 64, 132, 207, 24, 98, 138, 201, 28, 216, 200, 70, 171, 146, 1, 160, 143, 122,
+        218, 164, 77, 223, 41, 211, 160, 116, 215, 199, 143, 31, 60, 204, 227, 136, 128, 107, 80, 1,
+        84, 117, 88, 73, 120, 78, 42, 210, 143, 123, 103, 218, 107, 127, 119, 209, 33, 238, 62, 167,
+        199, 165, 171, 159, 30, 187, 81, 214, 137, 70, 45, 58, 83, 124, 169, 68, 152, 73, 58, 45,
+        214, 214, 239, 118, 210, 107, 117, 165, 187, 255, 217
+    ]
+
+
+private fixture_hdr() -> [127]u8 =
+    [
+        35, 63, 82, 65, 68, 73, 65, 78, 67, 69, 10, 71, 65, 77, 77, 65, 61, 49, 10, 80,
+        82, 73, 77, 65, 82, 73, 69, 83, 61, 48, 32, 48, 32, 48, 32, 48, 32, 48, 32, 48,
+        32, 48, 32, 48, 10, 70, 79, 82, 77, 65, 84, 61, 51, 50, 45, 98, 105, 116, 95, 114,
+        108, 101, 95, 114, 103, 98, 101, 10, 10, 45, 89, 32, 51, 32, 43, 88, 32, 52, 10, 128,
+        0, 0, 129, 0, 128, 0, 129, 0, 0, 128, 129, 128, 128, 128, 129, 0, 0, 0, 0, 221,
+        52, 14, 126, 49, 114, 212, 122, 147, 32, 8, 128, 22, 65, 135, 124, 59, 93, 136, 126, 94,
+        126, 163, 127, 102, 127, 154, 128
+    ]
+

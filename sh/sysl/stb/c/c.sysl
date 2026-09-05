@@ -1,0 +1,163 @@
+module sh.sysl.stb.c
+
+// stb as C declares it: the three headers vendored beside this file, and one `extern` per entry
+// point the layer above reaches.
+//
+// **Everything that is C lives in this directory** -- the three headers as they come from upstream,
+// the three one-line translation units that compile them, the `shim.c` that answers for the one
+// thing sysl cannot be, the `shim.h` that says what those answers are, and this file of
+// declarations over all of it. Nothing here is meant to be called by a program: a decode hands back
+// a raw pointer nobody owns, a status is a bare `int`, and a length comes back through an
+// out-parameter. `sh.sysl.stb` is what an application imports.
+//
+// The split keeps two jobs apart. This one has to be **faithful** -- a signature that disagrees with
+// the C links perfectly and corrupts the call at run time, and nothing in this arrangement checks
+// one against the other, so each declaration below was read out of the header rather than
+// remembered. The other one has to be **pleasant**, which is a different question.
+//
+// ==Almost nothing here is a shim, which is the opposite of qoi==
+//
+// qoi's binding is shims all the way down, because all three of its entry points `malloc` their
+// answer and it has no way to say so. stb has the same shape and this package takes the other road:
+// it binds `stbi_image_free` and lets a sysl destructor call it. What that buys is the whole of
+// stb_image's surface for the cost of five `extern`s -- 8-bit, 16-bit and floating-point decodes,
+// the info probe, and the failure string -- rather than a wrapper each.
+//
+// The one place a shim is unavoidable is **writing**, and `shim.c` says why at length: stb hands an
+// encoding over one chunk at a time through a callback, and the growing buffer that collects them
+// cannot be on this side of the boundary.
+
+@link("m")
+@include("stb_image.h")
+@include("stb_image_write.h")
+@include("stb_image_resize2.h")
+@include("shim.h")
+
+// ## The numbers, asked for rather than written down
+
+// What `shim.c`'s five encoders answer. **These are the shim's own**, because stb reports one `int`
+// for "I will not encode this" and has no way at all to report "the machine ran out of memory
+// halfway" -- only the collector knows that, being the thing that failed to grow.
+c const
+    OK: int        = "SYSL_STB_OK"
+    REFUSED: int   = "SYSL_STB_REFUSED"
+    NO_MEMORY: int = "SYSL_STB_NO_MEMORY"
+
+// How `resize` is to read the channels it is handed. These are `stbir_pixel_layout`'s enumerators,
+// and the numbers are **not** the channel count: `STBIR_BGR` is 0 and `STBIR_4CHANNEL` is 5, so a
+// binding that passed a count where a layout was wanted would silently resize BGR data as though it
+// were something else. That is the whole reason they are asked for by name.
+//
+// The `_PM` forms are for colour channels that already have alpha multiplied into them. Resizing
+// non-premultiplied alpha correctly means weighting by alpha, which is what the plain `RGBA` forms
+// do and what the `_PM` forms deliberately skip.
+c const
+    L1: int       = "STBIR_1CHANNEL"
+    L2: int       = "STBIR_2CHANNEL"
+    RGB: int      = "STBIR_RGB"
+    BGR: int      = "STBIR_BGR"
+    L4: int       = "STBIR_4CHANNEL"
+    RGBA: int     = "STBIR_RGBA"
+    BGRA: int     = "STBIR_BGRA"
+    ARGB: int     = "STBIR_ARGB"
+    ABGR: int     = "STBIR_ABGR"
+    RA: int       = "STBIR_RA"
+    AR: int       = "STBIR_AR"
+    RGBA_PM: int  = "STBIR_RGBA_PM"
+    BGRA_PM: int  = "STBIR_BGRA_PM"
+    ARGB_PM: int  = "STBIR_ARGB_PM"
+    ABGR_PM: int  = "STBIR_ABGR_PM"
+    RA_PM: int    = "STBIR_RA_PM"
+    AR_PM: int    = "STBIR_AR_PM"
+
+// ## Decoding -- stb_image's own entry points, bound as themselves
+//
+// Each answers a pointer to `w * h * channels` elements that the caller releases with `image_free`,
+// or null. `channels_in_file` is filled in with what the image really held, which is not the same
+// as what was asked for: `desired` of 0 means "whatever it has", and any of 1..4 converts.
+//
+// **`len` is an `int` rather than a `usize`**, which is stb's decision and not a transcription
+// slip -- the layer above refuses an input too long to say, rather than truncating it here.
+
+extern "stbi_load_from_memory" load(data: *u8, len: int, w: *int, h: *int,
+                                    channels_in_file: *int, desired: int) -> *u8
+
+// The same decode at sixteen bits a channel, for the PNG and PNM depths that carry them. An 8-bit
+// image read this way is widened rather than refused.
+extern "stbi_load_16_from_memory" load_16(data: *u8, len: int, w: *int, h: *int,
+                                          channels_in_file: *int, desired: int) -> *u16
+
+// The same decode as floating point. This is how a Radiance `.hdr` is read without being flattened
+// to bytes; an ordinary image read this way is converted, gamma and all.
+extern "stbi_loadf_from_memory" load_f(data: *u8, len: int, w: *int, h: *int,
+                                       channels_in_file: *int, desired: int) -> *f32
+
+// The shape of an image without decoding it. Answers 1 and fills the three out-parameters in, or 0
+// and touches nothing.
+extern "stbi_info_from_memory" info(data: *u8, len: int, w: *int, h: *int, comp: *int) -> int
+
+// Whether the bytes are a Radiance image, which is what decides whether `load_f` is reading real
+// high-dynamic-range data or converting.
+extern "stbi_is_hdr_from_memory" is_hdr(data: *u8, len: int) -> int
+
+// Whether the bytes carry sixteen bits a channel, and are therefore worth `load_16`.
+extern "stbi_is_16_bit_from_memory" is_16_bit(data: *u8, len: int) -> int
+
+// What stb said about the last decode that failed, as a C string, or null if nothing has.
+//
+// **It is global state**, and stb makes it thread-local where the compiler offers a way to. The
+// layer above reads it immediately after a null return and copies it, which is the only use of it
+// that is sound.
+extern "stbi_failure_reason" failure_reason() -> *u8
+
+// Releases what a decode handed back. **stb's own**, rather than `free` behind a name of this
+// package's choosing, because stb reserves the right to allocate a decode from somewhere else.
+extern "stbi_image_free" image_free(p: *u8) -> unit
+
+// ## Encoding -- `shim.c`'s four, all one shape
+//
+// **Four rather than five: there is no HDR writer**, and `shim.h` says why at length -- stb
+// guards its whole Radiance writer behind `STBI_WRITE_NO_STDIO`, which this package sets.
+//
+// Each collects the encoding into one `malloc`'d buffer, writes the pointer and the length through
+// `out` and `len`, and answers one of the three statuses above. What comes back is released with
+// `write_free`.
+
+extern "sysl_stb_write_png" write_png(pixels: *u8, w: int, h: int, comp: int, stride: int,
+                                      out: **u8, len: *int) -> int
+
+extern "sysl_stb_write_jpg" write_jpg(pixels: *u8, w: int, h: int, comp: int, quality: int,
+                                      out: **u8, len: *int) -> int
+
+extern "sysl_stb_write_bmp" write_bmp(pixels: *u8, w: int, h: int, comp: int,
+                                      out: **u8, len: *int) -> int
+
+extern "sysl_stb_write_tga" write_tga(pixels: *u8, w: int, h: int, comp: int,
+                                      out: **u8, len: *int) -> int
+
+
+// Releases what an encoder handed back. Deliberately **not** `image_free`: the two are the same
+// call today, and which allocator each end used is not this binding's to assume stays that way.
+extern "sysl_stb_free" write_free(p: *u8) -> unit
+
+// ## Resizing -- stb_image_resize2's own, bound as themselves
+//
+// **The output is the caller's storage**, which is why none of these needs a shim and why the
+// package's resizing half asks for no allocator. The `int` returned is the output pointer again, or
+// null; a stride of 0 means the rows are packed.
+//
+// `srgb` and `linear` differ in the space the filtering happens in, and the difference is visible:
+// averaging two sRGB bytes as though they were light is what makes a naively downscaled image look
+// too dark. `srgb` is what almost every 8-bit image wants.
+
+extern "stbir_resize_uint8_srgb" resize_srgb(src: *u8, sw: int, sh: int, s_stride: int,
+                                             dst: *u8, dw: int, dh: int, d_stride: int,
+                                             layout: int) -> *u8
+
+extern "stbir_resize_uint8_linear" resize_linear(src: *u8, sw: int, sh: int, s_stride: int,
+                                                 dst: *u8, dw: int, dh: int, d_stride: int,
+                                                 layout: int) -> *u8
+
+extern "stbir_resize_float_linear" resize_float(src: *f32, sw: int, sh: int, s_stride: int,
+                                                dst: *f32, dw: int, dh: int, d_stride: int,
+                                                layout: int) -> *f32

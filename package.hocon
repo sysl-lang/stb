@@ -1,0 +1,88 @@
+// Images -- decoding, encoding and resizing -- bound to Sean Barrett's stb single-header libraries.
+//
+// There is no `dependencies` block because stb depends on nothing: the three headers are carried in
+// this package and reach for `stdlib.h`, `string.h`, `math.h` and `assert.h` and no further. They
+// are vendored because stb is not a library anybody has installed -- it is distributed as headers
+// you copy, which is the whole of its design.
+//
+// This is the block a *consumer* writes to reach this package:
+//
+//     dependencies {
+//       stb { git = "github.com/sysl-lang/stb", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository.
+//
+// **Three libraries, one package, and that is the right count here.** `~/dev/sysl-lang/CLAUDE.md`
+// says the test is the package manager rather than the linker: SDL3's companions are four packages
+// because they are four *formulae*, and a machine may genuinely not have the one an unpruned
+// `-lSDL3_ttf` names. Nothing is linked here at all -- the C is compiled into the artifact -- so
+// there is no second thing for a consumer to go and get, and splitting would charge three
+// coordinates and three versions to keep in step for nothing.
+//
+// **What splitting would have bought is bought another way.** Each library is compiled in its own
+// translation unit -- `image.c`, `write.c`, `resize.c` -- so each becomes its own object, and a
+// program that only decodes does not link the other two. That matters most for the resizer, which
+// is sixty thousand lines of vector code.
+
+package {
+  name    = "stb"
+  version = "0.1.0"
+
+  // **The oldest compiler this builds with.** `Image` and `Encoded` are `Drop` types whose
+  // constructors answer `&T`, which 0.0.91's `DropReturnCheck` is what keeps honest, and the
+  // pleasant layer leans on `?` converting an error through `From`, which arrived at 0.0.85.
+  sysl = "0.0.91"
+}
+
+// **`heap`, and nothing else, and both halves of that took a decision.**
+//
+// `heap` is here because a decode and an encode both answer storage whose size nobody knew in
+// advance. qoi is the package that took the other road: it redirects QOI's allocator at a slice the
+// caller already owns, and asks for no capabilities at all.
+//
+// **That road was considered here and is not available.** qoi works because `qoi_encode` computes
+// the size it needs *before* it asks for it, and makes exactly one allocation. stb's decoders do
+// neither -- a PNG decode allocates the output and then grows a zlib window by `realloc` as it
+// goes, and no bound on the second is knowable from the header. A caller-supplied arena would have
+// had to be sized by guesswork and would have failed on real images.
+//
+// So this binding does the honest thing instead: it lets stb use the C allocator, and makes the
+// lifetime a sysl destructor's problem. `Image` and `Encoded` are boxed types whose `Drop` calls
+// stb's `stbi_image_free` and the shim's `free` respectively.
+//
+// **`posix` is deliberately absent, and `STBI_NO_STDIO` is what earns it.** stb's file-reading and
+// file-writing entry points are the only things in any of the three headers that touch an operating
+// system, and they are compiled out. Reading a file is `sysl.fs`'s job and the bytes it hands back
+// are what `decode` wants anyway. What is left opens nothing, reads no clock, and asks for no
+// environment.
+//
+// **The resizing half asks for nothing at all**, which is worth knowing separately: it writes into
+// storage the caller already has, so a program that only resizes never reaches the allocator this
+// clause is here for.
+requires {
+  heap = true
+}
+
+// The compile-time options, keyed by the translation unit each one configures.
+//
+// **These are here rather than in the `.c` files because they are choices**, and a reader looking
+// for what this package decided about stb should find it in one place. The implementation macros
+// -- `STB_IMAGE_IMPLEMENTATION` and its two siblings -- are *not* options and stay in the files
+// they turn into bodies.
+defines {
+
+  // No `stbi_load`, no `stbi_load_from_file`, no `FILE` anywhere. This is what keeps `posix` out of
+  // the `requires` block above.
+  "sh/sysl/stb/c/image.c" {
+    STBI_NO_STDIO = true
+  }
+
+  // The same at the writing end. `shim.c` gets it too, and has to: the two units share
+  // `stb_image_write.h`, and a macro that changes which entry points are declared has to be given
+  // to every unit that reads the header or they disagree about the library's surface.
+  "sh/sysl/stb/c/{write,shim}.c" {
+    STBI_WRITE_NO_STDIO = true
+  }
+}

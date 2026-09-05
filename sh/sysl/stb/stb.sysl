@@ -1,0 +1,495 @@
+module sh.sysl.stb
+
+import sh.sysl.stb.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.text.from_cstring
+
+// Images: decoding, encoding and resizing, bound to the three stb headers sitting beside this file.
+//
+// stb is Sean Barrett's set of single-header C libraries, and the three here are the image ones.
+// `stb_image` reads PNG, JPEG, BMP, TGA, PSD, GIF, HDR, PIC and PNM; `stb_image_write` writes PNG,
+// JPEG, BMP, TGA and HDR; `stb_image_resize2` scales what either end produced. They are vendored
+// because that is how stb is distributed -- there is no library to install, and the headers are in
+// this repository.
+//
+// ==Three verbs, and the middle one is the whole shape of this package==
+//
+//     val img = decode(bytes)?                   // reading -- stb owns the pixels, `Image` frees them
+//     val png = encode_png(img.pixels(), ...)?   // writing -- the shim owns them, `Encoded` frees them
+//     resize(src, 640, 480, dst, 320, 240, Layout.Rgba)?   // scaling -- the caller owns both sides
+//
+// **A decode and an encode each answer a boxed handle rather than a slice**, because the storage is
+// C's and something has to release it. `Image` and `Encoded` are `Drop` types, and both constructors
+// return `&T` -- which is not a style choice: a destructor fires when a *box's* count reaches zero,
+// so a constructor answering a plain `T` would hand back a copy whose `Drop` never runs, and the
+// binding would leak every image it ever read while passing every test.
+//
+// `pixels()` and `bytes()` are views into that storage and live exactly as long as the handle does.
+//
+// **Resizing needs neither**, because stb writes into the output the caller already has. That half
+// of this package allocates nothing at all.
+//
+// ==What is not here==
+//
+// **Nothing reads or writes a file.** `STBI_NO_STDIO` and `STBI_WRITE_NO_STDIO` are compiled in, so
+// stb's file entry points do not exist; `sysl.fs` reads the bytes and hands them here. That is what
+// keeps this package's `requires` block down to `heap`.
+//
+// **There is no HDR *writing*, though there is HDR reading.** stb guards its whole Radiance writer
+// behind `STBI_WRITE_NO_STDIO` -- the callback form included, not merely the file form -- because
+// the one line that emits the header uses `sprintf`, and the header says so itself. Keeping it
+// would mean giving this package `<stdio.h>` and the file entry points that come with it, which is
+// the capability claim above. `decode_f` is unaffected: it is in the other library and has no such
+// guard, so a `.hdr` reads perfectly well and simply cannot be written back.
+//
+// **There is no animation.** `stbi_load_gif_from_memory` hands back every frame at once behind a
+// second allocation for the delays, which is a different ownership shape from everything else here;
+// a GIF decodes to its first frame. Worth adding when somebody wants it.
+
+// Why a decode, an encode or a resize did not happen.
+enum Error
+    // stb read the input and would not have it. The string is `stbi_failure_reason` where stb left
+    // one -- "unknown image type", "corrupt jpeg", "bad png sig" and so on -- and a general sentence
+    // where it did not.
+    //
+    // **It is copied out immediately**, because the reason is global state that the next decode
+    // overwrites, and a caller that held onto it would read somebody else's failure.
+    Refused(why: string)
+
+    // The machine ran out of memory part way through. **This is a distinct answer from `Refused` and
+    // has to be**: stb reports success for an encode whose chunks were all handed to a collector
+    // that had already failed to grow, so only `shim.c` knows the difference.
+    NoMemory
+
+    // The input is longer than stb can be told about. Every length in stb's API is an `int`, so an
+    // input above two gigabytes cannot be described to it; truncating it here would decode a
+    // prefix and call it the image.
+    TooLarge
+
+    // The caller's slice and the caller's dimensions disagree. `needed` is how many elements the
+    // width, height and channel count say there should be.
+    //
+    // stb is never told how long an input pixel slice is -- the length is implied by the shape --
+    // so a slice shorter than the shape describes would be read past its end. This is that check,
+    // made here rather than left for C to discover.
+    Shape(needed: usize)
+
+    // What went wrong, as a sentence. `Refused` carries stb's own words, which are worth passing
+    // through rather than paraphrasing -- "corrupt jpeg" says more than "the image was refused".
+    message(self) -> string = self match
+        Refused(why)  -> why
+        NoMemory      -> "out of memory"
+        TooLarge      -> "the input is larger than stb can be told about"
+        Shape(needed) -> f"the pixels do not match the dimensions given — ${needed}%d elements were needed"
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+
+// How many channels a decode should answer, whatever the file holds.
+//
+// stb converts on the way out, so a greyscale PNG asked for as `Rgba` arrives with the grey value in
+// three channels and an opaque alpha. `Source` is the one that does not convert, and it is the
+// default because it is the only answer that loses nothing.
+enum Channels
+    // Whatever the image holds. `Image.channels` then says what that turned out to be.
+    Source
+
+    // One channel: grey.
+    Grey
+
+    // Two: grey and alpha.
+    GreyAlpha
+
+    // Three: red, green and blue.
+    Rgb
+
+    // Four: red, green, blue and alpha.
+    Rgba
+
+    // The number stb spells this as, which is also the number of channels -- 0 meaning "do not
+    // convert". Unlike a resize `Layout`, this really is a count.
+    code(self) -> int = self match
+        Source    -> 0
+        Grey      -> 1
+        GreyAlpha -> 2
+        Rgb       -> 3
+        Rgba      -> 4
+end Channels
+
+// How `resize` is to read the channels it is handed.
+//
+// **A layout is not a channel count**, which is the trap this enum exists to close: stb spells
+// `STBIR_BGR` as 0 and `STBIR_4CHANNEL` as 5, so a caller who passed 3 for "three channels" would
+// get RGB by luck and a caller who passed 4 would get RGBA by luck and neither would be reading the
+// header. Every arm below asks the C for its own number.
+//
+// The `_PM` forms are for colour that already has alpha multiplied into it. Resizing ordinary alpha
+// correctly means weighting the colour by it, which the plain forms do; the `_PM` forms skip that
+// because the multiplication has already happened.
+enum Layout
+    Grey
+    GreyAlpha
+    Rgb
+    Bgr
+    FourChannel
+    Rgba
+    Bgra
+    Argb
+    Abgr
+    RedAlpha
+    AlphaRed
+    RgbaPremultiplied
+    BgraPremultiplied
+    ArgbPremultiplied
+    AbgrPremultiplied
+    RedAlphaPremultiplied
+    AlphaRedPremultiplied
+
+    code(self) -> int = self match
+        Grey                  -> c.L1
+        GreyAlpha             -> c.L2
+        Rgb                   -> c.RGB
+        Bgr                   -> c.BGR
+        FourChannel           -> c.L4
+        Rgba                  -> c.RGBA
+        Bgra                  -> c.BGRA
+        Argb                  -> c.ARGB
+        Abgr                  -> c.ABGR
+        RedAlpha              -> c.RA
+        AlphaRed              -> c.AR
+        RgbaPremultiplied     -> c.RGBA_PM
+        BgraPremultiplied     -> c.BGRA_PM
+        ArgbPremultiplied     -> c.ARGB_PM
+        AbgrPremultiplied     -> c.ABGR_PM
+        RedAlphaPremultiplied -> c.RA_PM
+        AlphaRedPremultiplied -> c.AR_PM
+
+    // How many bytes a pixel in this layout takes, which is what sizes an output buffer.
+    channels(self) -> usize = self match
+        Grey                                          -> 1
+        GreyAlpha | RedAlpha | AlphaRed               -> 2
+        RedAlphaPremultiplied | AlphaRedPremultiplied -> 2
+        Rgb | Bgr                                     -> 3
+        _                                             -> 4
+end Layout
+
+// The shape of an image, as `probe` reads it out of the first few bytes.
+struct Shape
+    width: int
+    height: int
+
+    // How many channels the file holds. A decode may be asked for a different number.
+    channels: int
+end Shape
+
+// Decoded pixels, owned by stb until this handle goes.
+//
+// The rows are packed -- `width * channels` bytes each, no padding -- and the first pixel is the top
+// left, which is the opposite of what a `.bmp` stores and is stb's normalisation rather than
+// something this binding does.
+struct Image
+    private p: *u8
+
+    width: int
+    height: int
+
+    // How many channels the pixels really have, which is what was asked for unless that was
+    // `Source`.
+    channels: int
+
+    // How many the file held, whatever was asked for. Worth reading before re-encoding: a
+    // greyscale JPEG decoded as `Rgba` is three-quarters padding, and writing it back that way
+    // triples the file.
+    source_channels: int
+
+    // The pixels. A view into stb's storage, so it lives exactly as long as this handle -- and a
+    // caller keeping the bytes past that has to copy them.
+    pixels(self) -> []const u8 = self.p[0..<self.len()]
+
+    // How many bytes the pixels occupy.
+    len(self) -> usize = usize(self.width) * usize(self.height) * usize(self.channels)
+end Image
+
+// stb allocated the pixels, so stb frees them -- `stbi_image_free` rather than a `free` of this
+// package's choosing, because which allocator a decode came out of is stb's business.
+impl Drop for Image
+    drop(self)
+        c.image_free(self.p)
+    end drop
+
+// The same, at sixteen bits a channel. Made by `decode_16`.
+//
+// **It is a separate type rather than `Image` with a depth field**, because the pixels are `u16`
+// and a `[]const u8` view over them would hand a caller bytes in the machine's own order and let
+// them read it as anything. The two types differ in exactly one thing and it is the one that
+// matters.
+struct Image16
+    private p: *u16
+
+    width: int
+    height: int
+    channels: int
+    source_channels: int
+
+    // The pixels, each channel a `u16` in the machine's byte order.
+    pixels(self) -> []const u16 = self.p[0..<self.len()]
+
+    // How many `u16`s the pixels occupy -- elements, not bytes.
+    len(self) -> usize = usize(self.width) * usize(self.height) * usize(self.channels)
+end Image16
+
+impl Drop for Image16
+    drop(self)
+        c.image_free(ptr_cast(self.p))
+    end drop
+
+// The same again as floating point, which is what a Radiance `.hdr` decodes to without being
+// flattened. Made by `decode_f`.
+//
+// The values are linear light and are **not** bounded to 0..1 -- that is the whole point of a
+// high-dynamic-range image, and anything that displays one has to decide on an exposure first.
+struct ImageF
+    private p: *f32
+
+    width: int
+    height: int
+    channels: int
+    source_channels: int
+
+    // The pixels, each channel an `f32` of linear light.
+    pixels(self) -> []const f32 = self.p[0..<self.len()]
+
+    // How many `f32`s the pixels occupy -- elements, not bytes.
+    len(self) -> usize = usize(self.width) * usize(self.height) * usize(self.channels)
+end ImageF
+
+impl Drop for ImageF
+    drop(self)
+        c.image_free(ptr_cast(self.p))
+    end drop
+
+// An encoding, owned by the shim until this handle goes.
+struct Encoded
+    private p: *u8
+    private n: usize
+
+    // The encoded bytes -- a whole PNG, JPEG, BMP, TGA or Radiance file, ready to be written out or
+    // sent. A view into the shim's storage, so it lives exactly as long as this handle.
+    bytes(self) -> []const u8 = self.p[0..<self.n]
+
+    // How many bytes the encoding came to.
+    len(self) -> usize = self.n
+end Encoded
+
+// The shim allocated this one, so the shim frees it. Deliberately not `stbi_image_free`: the two
+// are the same call today and keeping them apart is what stops this binding depending on that.
+impl Drop for Encoded
+    drop(self)
+        c.write_free(self.p)
+    end drop
+
+// ## Reading
+
+// What stb said about the decode that just failed, copied out of its global before anything else can
+// overwrite it.
+private refused() -> Error
+    val p = c.failure_reason()
+
+    if usize(p) == 0 then
+        Refused("stb would not read this image and did not say why")
+    else
+        from_cstring(p) match
+            Ok(why) -> Refused(why)
+            Err(_)  -> Refused("stb would not read this image")
+
+// stb takes every length as an `int`, so this is the one thing about an input it cannot be told.
+private fits(data: []const u8) -> Result[int, Error] =
+    if data.len > usize(2147483647) then Err(TooLarge) else Ok(int(data.len))
+
+// Reads an image, converting to `want` channels on the way out.
+//
+// The format is recognised from the bytes rather than from a name, so there is nothing to tell it
+// what it is looking at:
+//
+//     val img = decode(bytes)?
+//     print(f"${img.width}%d x ${img.height}%d, ${img.channels}%d channels")
+//
+// Every 8-bit format stb reads arrives here: PNG, JPEG, BMP, TGA, PSD, GIF (first frame), PIC, PNM,
+// and HDR flattened to bytes. `decode_16` and `decode_f` are for the two depths this one would
+// narrow.
+decode(data: []const u8, want: Channels = Channels.Source) -> Result[&Image, Error]
+    val len = fits(data)?
+
+    var w = 0
+    var h = 0
+    var had = 0
+
+    val p = c.load(as_ptr(data), len, &w, &h, &had, want.code())
+
+    if usize(p) == 0 then return Err(refused())
+
+    val channels = if want == Channels.Source then had else want.code()
+
+    Ok(Image(p, w, h, channels, had))
+
+// The same decode at sixteen bits a channel, for the PNG and PNM depths that carry them.
+//
+// An 8-bit image read this way is widened rather than refused, so `probe` or `is_16_bit` is what
+// says whether the extra depth is really there.
+decode_16(data: []const u8, want: Channels = Channels.Source) -> Result[&Image16, Error]
+    val len = fits(data)?
+
+    var w = 0
+    var h = 0
+    var had = 0
+
+    val p = c.load_16(as_ptr(data), len, &w, &h, &had, want.code())
+
+    if usize(p) == 0 then return Err(refused())
+
+    val channels = if want == Channels.Source then had else want.code()
+
+    Ok(Image16(p, w, h, channels, had))
+
+// The same decode as floating point, which is how a Radiance `.hdr` is read without being flattened
+// into bytes. An ordinary image read this way is converted, gamma and all.
+decode_f(data: []const u8, want: Channels = Channels.Source) -> Result[&ImageF, Error]
+    val len = fits(data)?
+
+    var w = 0
+    var h = 0
+    var had = 0
+
+    val p = c.load_f(as_ptr(data), len, &w, &h, &had, want.code())
+
+    if usize(p) == 0 then return Err(refused())
+
+    val channels = if want == Channels.Source then had else want.code()
+
+    Ok(ImageF(p, w, h, channels, had))
+
+// The shape of an image without decoding it, which is a few bytes of header rather than the whole
+// file. Worth reaching for before deciding whether to decode something at all.
+probe(data: []const u8) -> Result[Shape, Error]
+    val len = fits(data)?
+
+    var w = 0
+    var h = 0
+    var comp = 0
+
+    if c.info(as_ptr(data), len, &w, &h, &comp) == 0 then return Err(refused())
+
+    Ok(Shape(w, h, comp))
+
+// Whether these bytes are a Radiance image, and therefore whether `decode_f` reads real
+// high-dynamic-range data or converts an ordinary one.
+is_hdr(data: []const u8) -> bool =
+    fits(data) match
+        Ok(len) -> c.is_hdr(as_ptr(data), len) != 0
+        Err(_)  -> false
+
+// Whether these bytes carry sixteen bits a channel, and are therefore worth `decode_16`.
+is_16_bit(data: []const u8) -> bool =
+    fits(data) match
+        Ok(len) -> c.is_16_bit(as_ptr(data), len) != 0
+        Err(_)  -> false
+
+// ## Writing
+
+// Turns the shim's three statuses into a `Result` over the pointer and length it wrote.
+private encoded(status: int, p: *u8, n: int) -> Result[&Encoded, Error] =
+    status match
+        c.OK        -> Ok(Encoded(p, usize(n)))
+        c.NO_MEMORY -> Err(NoMemory)
+        _           -> Err(Refused("stb would not encode an image of this shape"))
+
+// Checks a caller's pixels against the shape they said those pixels have, since stb is never told
+// how long the slice is and would read past its end.
+private enough(pixels: []const u8, w: int, h: int, comp: int) -> Result[unit, Error]
+    val needed = usize(w) * usize(h) * usize(comp)
+
+    if pixels.len < needed then Err(Shape(needed)) else Ok(())
+
+// Encodes as PNG. Lossless, and what to reach for unless the image is a photograph.
+//
+// `stride` is the distance between rows in the input, in bytes; 0 means the rows are packed, which
+// is what a decode from this package hands back.
+encode_png(pixels: []const u8, width: int, height: int, channels: int,
+           stride: int = 0) -> Result[&Encoded, Error]
+    enough(pixels, width, height, channels)?
+
+    var p: *u8 = ptr_cast(0usize)
+    var n = 0
+
+    encoded(c.write_png(as_ptr(pixels), width, height, channels, stride, &p, &n), p, n)
+
+// Encodes as JPEG at `quality` from 1 to 100. Lossy, and much smaller than PNG on a photograph.
+//
+// stb's encoder is a baseline one: no progressive mode, no chroma subsampling control, no
+// arithmetic coding. It is small and it is fast, and a file it writes is read by everything.
+encode_jpg(pixels: []const u8, width: int, height: int, channels: int,
+           quality: int = 90) -> Result[&Encoded, Error]
+    enough(pixels, width, height, channels)?
+
+    var p: *u8 = ptr_cast(0usize)
+    var n = 0
+
+    encoded(c.write_jpg(as_ptr(pixels), width, height, channels, quality, &p, &n), p, n)
+
+// Encodes as a Windows bitmap. Uncompressed, and the alpha channel is dropped -- stb writes the
+// 24-bit form, so a four-channel input loses its fourth.
+encode_bmp(pixels: []const u8, width: int, height: int,
+           channels: int) -> Result[&Encoded, Error]
+    enough(pixels, width, height, channels)?
+
+    var p: *u8 = ptr_cast(0usize)
+    var n = 0
+
+    encoded(c.write_bmp(as_ptr(pixels), width, height, channels, &p, &n), p, n)
+
+// Encodes as Targa, run-length encoded.
+encode_tga(pixels: []const u8, width: int, height: int,
+           channels: int) -> Result[&Encoded, Error]
+    enough(pixels, width, height, channels)?
+
+    var p: *u8 = ptr_cast(0usize)
+    var n = 0
+
+    encoded(c.write_tga(as_ptr(pixels), width, height, channels, &p, &n), p, n)
+
+// ## Scaling
+
+// Scales `src` into `dst`, which is storage the caller already has.
+//
+// **Nothing is allocated here** -- stb writes into the output slice -- so this is the one part of
+// the package that would work with no heap at all.
+//
+// `srgb` decides the space the filtering happens in, and the difference is visible rather than
+// theoretical: averaging two sRGB bytes as though they were quantities of light is what makes a
+// naively downscaled image come out too dark. It is the right answer for almost every 8-bit image,
+// which is why it is the default.
+//
+//     var small: []u8 = [0; 320 * 240 * 4]
+//     resize(img.pixels(), img.width, img.height, small, 320, 240, Layout.Rgba)?
+resize(src: []const u8, src_width: int, src_height: int,
+       dst: []u8, dst_width: int, dst_height: int,
+       layout: Layout, srgb: bool = true) -> Result[unit, Error]
+    val per = layout.channels()
+
+    if src.len < usize(src_width) * usize(src_height) * per then
+        return Err(Shape(usize(src_width) * usize(src_height) * per))
+
+    if dst.len < usize(dst_width) * usize(dst_height) * per then
+        return Err(Shape(usize(dst_width) * usize(dst_height) * per))
+
+    val out =
+        if srgb then
+            c.resize_srgb(as_ptr(src), src_width, src_height, 0,
+                          as_mut_ptr(dst), dst_width, dst_height, 0, layout.code())
+        else
+            c.resize_linear(as_ptr(src), src_width, src_height, 0,
+                            as_mut_ptr(dst), dst_width, dst_height, 0, layout.code())
+
+    if usize(out) == 0 then Err(Refused("stb would not resize an image of this shape")) else Ok(())
+
