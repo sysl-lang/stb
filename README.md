@@ -4,6 +4,8 @@ Image decoding, encoding and resizing for [sysl](https://github.com/sysl-lang/sy
 [Sean Barrett's stb libraries](https://github.com/nothings/stb) — `stb_image`, `stb_image_write` and
 `stb_image_resize2`.
 
+*An independent sysl package for stb. It is not affiliated with or endorsed by stb's authors or trademark holders.*
+
 Nine formats in, four out, and a resampler between them:
 
 | | |
