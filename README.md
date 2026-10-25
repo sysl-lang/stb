@@ -32,7 +32,7 @@ sh/sysl/stb/
         stb_image.h          vendored, unmodified — nothings/stb, MIT / public domain
         stb_image_write.h    vendored, unmodified
         stb_image_resize2.h  vendored, unmodified
-package.hocon           who this package is, what it needs, and the compile-time options
+sysl.hocon              who this package is, what it needs, and the compile-time options
 ```
 
 The module is **`sh.sysl.stb`**, and the directories are that name. **Everything that is C lives in
@@ -53,12 +53,12 @@ thousand lines of vector code.
 
 ```hocon
 dependencies {
-  stb { git = "github.com/sysl-lang/stb", version = "0.1.0" }
+  stb { git = "github.com/sysl-lang/stb", version = "0.1.1" }
 }
 ```
 
 The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is the
-tag `v0.1.0` here. Nothing has to be installed and no flags are needed — `sysl build` and
+tag `v0.1.1` here. Nothing has to be installed and no flags are needed — `sysl build` and
 `sysl test .` both work from a clean clone.
 
 ## The surface

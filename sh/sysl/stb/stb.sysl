@@ -1,6 +1,7 @@
 module sh.sysl.stb
 
 import sh.sysl.stb.c
+import sysl.raw.ptr_cast
 import sysl.slices.{as_ptr, as_mut_ptr}
 import sysl.text.from_cstring
 
