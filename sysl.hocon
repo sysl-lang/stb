@@ -1,6 +1,7 @@
-// Images -- decoding, encoding and resizing -- bound to Sean Barrett's stb single-header libraries.
+// Images -- decoding, encoding and resizing -- and fonts -- metrics, kerning and glyph outlines --
+// bound to Sean Barrett's stb single-header libraries.
 //
-// There is no `dependencies` block because stb depends on nothing: the three headers are carried in
+// There is no `dependencies` block because stb depends on nothing: the four headers are carried in
 // this package and reach for `stdlib.h`, `string.h`, `math.h` and `assert.h` and no further. They
 // are vendored because stb is not a library anybody has installed -- it is distributed as headers
 // you copy, which is the whole of its design.
@@ -8,32 +9,32 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       stb { git = "github.com/sysl-lang/stb", version = "0.1.1" }
+//       stb { git = "github.com/sysl-lang/stb", version = "0.2.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.1` on this repository.
+// tag `v0.2.0` on this repository.
 //
-// **Three libraries, one package, and that is the right count here.** `~/dev/sysl-lang/CLAUDE.md`
+// **Four libraries, one package, and that is the right count here.** `~/dev/sysl-lang/CLAUDE.md`
 // says the test is the package manager rather than the linker: SDL3's companions are four packages
 // because they are four *formulae*, and a machine may genuinely not have the one an unpruned
 // `-lSDL3_ttf` names. Nothing is linked here at all -- the C is compiled into the artifact -- so
-// there is no second thing for a consumer to go and get, and splitting would charge three
-// coordinates and three versions to keep in step for nothing.
+// there is no second thing for a consumer to go and get, and splitting would charge four
+// coordinates and four versions to keep in step for nothing.
 //
 // **What splitting would have bought is bought another way.** Each library is compiled in its own
-// translation unit -- `image.c`, `write.c`, `resize.c` -- so each becomes its own object, and a
-// program that only decodes does not link the other two. That matters most for the resizer, which
-// is sixty thousand lines of vector code.
+// translation unit -- `image.c`, `write.c`, `resize.c`, `truetype.c` -- so each becomes its own
+// object, and a program that only decodes does not link the other three. That matters most for the
+// resizer, which is sixty thousand lines of vector code.
 
 package {
   name    = "stb"
-  version = "0.1.1"
+  version = "0.2.0"
 
-  // **The oldest compiler this builds with.** `Image` and `Encoded` are `Drop` types whose
-  // constructors answer `&T`, which 0.0.91's `DropReturnCheck` is what keeps honest, and the
-  // pleasant layer leans on `?` converting an error through `From`, which arrived at 0.0.85.
-  sysl = "0.6.0"
+  // **The oldest compiler this builds with.** The font module's checker wraps its arithmetic where
+  // stb's does (`-%`, `+%`, from 0.8.0) and its tests read their fixtures with `embed`; 0.8.10 is
+  // the release it was built and tested with.
+  sysl = "0.8.10"
 }
 
 // **`heap`, and nothing else, and both halves of that took a decision.**
@@ -52,8 +53,12 @@ package {
 // lifetime a sysl destructor's problem. `Image` and `Encoded` are boxed types whose `Drop` calls
 // stb's `stbi_image_free` and the shim's `free` respectively.
 //
+// The font half needs the heap for the same reason in a different shape: a `Font` holds stb's
+// record and a private copy of the font's bytes in one `malloc`'d block, because stb reads through
+// a pointer into those bytes for as long as the font lives. Its `Drop` frees the block.
+//
 // **`posix` is deliberately absent, and `STBI_NO_STDIO` is what earns it.** stb's file-reading and
-// file-writing entry points are the only things in any of the three headers that touch an operating
+// file-writing entry points are the only things in any of the four headers that touch an operating
 // system, and they are compiled out. Reading a file is `sysl.fs`'s job and the bytes it hands back
 // are what `decode` wants anyway. What is left opens nothing, reads no clock, and asks for no
 // environment.

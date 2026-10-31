@@ -32,6 +32,8 @@ module sh.sysl.stb.c
 @include("stb_image_write.h")
 @include("stb_image_resize2.h")
 @include("shim.h")
+@include("stb_truetype.h")
+@include("truetype_shim.h")
 
 // ## The numbers, asked for rather than written down
 
@@ -161,3 +163,116 @@ extern "stbir_resize_uint8_linear" resize_linear(src: *u8, sw: int, sh: int, s_s
 extern "stbir_resize_float_linear" resize_float(src: *f32, sw: int, sh: int, s_stride: int,
                                                 dst: *f32, dw: int, dh: int, d_stride: int,
                                                 layout: int) -> *f32
+
+// ## Fonts -- stb_truetype, bound as itself except for the one allocation `truetype.c` adds
+//
+// **stb trusts the bytes completely.** It is handed a pointer and never a length, and every offset
+// it reads out of the font is followed without a bounds check -- its own header says not to use it
+// on untrusted fonts. So nothing here may be called on bytes the layer above has not checked, and a
+// glyph index has to be in range before any of these is handed it: `stbtt_GetGlyphHMetrics` reads
+// `hmtx` at an offset computed from the index, whatever the index is.
+
+// What `sysl_stbtt_open` answers in its out-parameter.
+c const
+    TT_OK: int        = "SYSL_STBTT_OK"
+    TT_REFUSED: int   = "SYSL_STBTT_REFUSED"
+    TT_NO_MEMORY: int = "SYSL_STBTT_NO_MEMORY"
+
+// The four kinds of `stbtt_vertex`, and the vertex's size, which the layout of `Vertex` below has to
+// agree with -- a test asserts it.
+c const
+    VMOVE: u8         = "STBTT_vmove"
+    VLINE: u8         = "STBTT_vline"
+    VCURVE: u8        = "STBTT_vcurve"
+    VCUBIC: u8        = "STBTT_vcubic"
+    VERTEX_SIZE: int  = "sizeof(stbtt_vertex)"
+    KERNING_SIZE: int = "sizeof(stbtt_kerningentry)"
+
+// `stbtt_fontinfo`. Its fields are stb's business, and the only thing sysl ever holds is a pointer.
+opaque struct FontInfo
+
+// One step of a glyph's outline, exactly as stb lays it out: `short` coordinates in font units, the
+// kind, and a byte of padding. `cx, cy` is the control point of a quadratic and the first of a
+// cubic; `cx1, cy1` is a cubic's second.
+struct Vertex
+    x: i16
+    y: i16
+    cx: i16
+    cy: i16
+    cx1: i16
+    cy1: i16
+    kind: u8
+    padding: u8
+end Vertex
+
+// One pair of the legacy `kern` table.
+struct KerningEntry
+    glyph1: int
+    glyph2: int
+    advance: int
+
+// How many fonts the bytes hold: 1 for a plain font, the count for a collection, 0 for neither. Reads
+// twelve bytes and no further.
+extern "stbtt_GetNumberOfFonts" number_of_fonts(data: *u8) -> int
+
+// Where font `index` starts, or -1. **A negative index reads before the header**, so the layer above
+// checks the index first.
+extern "stbtt_GetFontOffsetForIndex" font_offset(data: *u8, index: int) -> int
+
+// The info over a private copy of the bytes, or null with the reason in `status`.
+extern "sysl_stbtt_open" open(data: *u8, len: int, offset: int, status: *int) -> *FontInfo
+
+// Frees the info and the copy behind it.
+extern "sysl_stbtt_close" close(info: *FontInfo) -> unit
+
+// The glyph a code point maps to, or 0 -- `.notdef` -- when the font has none.
+extern "stbtt_FindGlyphIndex" find_glyph(info: *FontInfo, codepoint: int) -> int
+
+// The scale that makes ascent minus descent `pixels` tall.
+extern "stbtt_ScaleForPixelHeight" scale_for_pixel_height(info: *FontInfo, pixels: f32) -> f32
+
+// The scale that makes one em `pixels` tall.
+extern "stbtt_ScaleForMappingEmToPixels" scale_for_em(info: *FontInfo, pixels: f32) -> f32
+
+// `hhea`'s ascent, descent and line gap, in font units.
+extern "stbtt_GetFontVMetrics" vmetrics(info: *FontInfo, ascent: *int, descent: *int,
+                                        line_gap: *int) -> unit
+
+// `OS/2`'s typographic ascent, descent and line gap; answers 0 and touches nothing without one.
+extern "stbtt_GetFontVMetricsOS2" vmetrics_os2(info: *FontInfo, ascent: *int, descent: *int,
+                                               line_gap: *int) -> int
+
+// `head`'s box around every glyph.
+extern "stbtt_GetFontBoundingBox" font_box(info: *FontInfo, x0: *int, y0: *int,
+                                           x1: *int, y1: *int) -> unit
+
+extern "stbtt_GetGlyphHMetrics" glyph_hmetrics(info: *FontInfo, glyph: int, advance: *int,
+                                               lsb: *int) -> unit
+
+// The adjustment between two glyphs: GPOS pair adjustment where the font has GPOS, the `kern` table
+// where it has only that.
+extern "stbtt_GetGlyphKernAdvance" glyph_kern(info: *FontInfo, g1: int, g2: int) -> int
+
+extern "stbtt_GetCodepointKernAdvance" codepoint_kern(info: *FontInfo, ch1: int, ch2: int) -> int
+
+// How many pairs the legacy `kern` table holds, and those pairs. GPOS is not listed.
+extern "stbtt_GetKerningTableLength" kerning_table_length(info: *FontInfo) -> int
+
+extern "stbtt_GetKerningTable" kerning_table(info: *FontInfo, table: *KerningEntry, len: int) -> int
+
+// A glyph's box in font units. Answers 0 for a glyph with no outline.
+extern "stbtt_GetGlyphBox" glyph_box(info: *FontInfo, glyph: int, x0: *int, y0: *int,
+                                     x1: *int, y1: *int) -> int
+
+extern "stbtt_IsGlyphEmpty" is_glyph_empty(info: *FontInfo, glyph: int) -> int
+
+// A glyph's outline: `*vertices` is set to an allocation released with `free_shape`, and the count
+// is answered. 0 vertices leaves nothing to release.
+extern "stbtt_GetGlyphShape" glyph_shape(info: *FontInfo, glyph: int, vertices: **Vertex) -> int
+
+extern "stbtt_FreeShape" free_shape(info: *FontInfo, vertices: *Vertex) -> unit
+
+// **No rasteriser is bound.** stb's rasteriser asserts on some outlines a malformed font can produce, at
+// `stb_truetype.h:3221` and `:3350`, with every edge inside the bitmap -- fuzzing under
+// AddressSanitizer reached both -- so `stbtt_GetGlyphBitmap`, `stbtt_Rasterize` and everything
+// built on them (SDFs, packing, baking) are left out.

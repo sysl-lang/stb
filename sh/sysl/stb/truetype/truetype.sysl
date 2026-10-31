@@ -1,0 +1,502 @@
+module sh.sysl.stb.truetype
+
+import sh.sysl.stb.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.{as_ptr, as_mut_ptr}
+
+// Fonts: metrics, kerning and glyph outlines, bound to `stb_truetype.h`.
+//
+// The use this is shaped for is turning text into geometry -- a glyph's outline as path commands, or
+// flattened into closed polygons that a mesher can extrude:
+//
+//     val font = load_font(embed("Inter.ttf"))?
+//     val text = text_outline(font, "Hello", 10.0)?     // every contour of every glyph, y up
+//
+// ==The font owns its bytes==
+//
+// stb's font record points into the font's bytes and reads through that pointer on every later
+// call, so the bytes must outlive it -- a rule C states only in a comment. Here `load_font` copies the
+// bytes into the same allocation as the record, so the two are born and freed together, the slice
+// handed in may go the moment `load_font` returns, and there is no way to hold a `Font` whose bytes
+// are gone. `Font` is a `Drop` type and `load_font` answers `&Font`.
+//
+// ==The bytes are checked before stb sees them==
+//
+// stb follows every offset in a font without a bounds check, and asserts -- ending the program -- on
+// several kinds of malformed font. `load_font` walks the same structure first, with the length in
+// hand, and refuses a font stb would read past or assert on; `check.sysl` lists what that covers. A
+// glyph broken inside itself does not refuse the font: that glyph alone cannot be drawn
+// (`can_draw`). A glyph index is checked against the font's glyph count on every call, because stb
+// reads `hmtx` at an offset computed from the index without asking.
+//
+// ==Units and directions==
+//
+// Everything a `Font` answers by itself is in **font units**, the integer grid the font was drawn on
+// (`units_per_em` to the em, y up, the baseline at 0). `outline` and `text_outline` scale and answer
+// `f64` points, still y up.
+//
+// ==What is not here==
+//
+// **Bitmaps.** stb's rasteriser asserts -- ending the program -- on some outlines a malformed font
+// can produce, at `stb_truetype.h:3221` and `:3350`, even with every edge inside the bitmap; fuzzing
+// under AddressSanitizer reached both. Nothing else in this module can end the program on bad
+// bytes, and a bitmap function that could would undo that. The polygons `outline` answers are what
+// a rasteriser of your choosing fills.
+//
+// **Signed distance fields, texture-atlas packing and baking** (`stbtt_GetGlyphSDF`,
+// `stbtt_PackFontRanges`, `stbtt_BakeFontBitmap`) are the GPU text-rendering half of stb, all built
+// on the same rasteriser or on its bitmaps. **Font names** (`stbtt_GetFontNameString`,
+// `stbtt_FindMatchingFont`) answer UTF-16BE pointers into the font and are not needed to draw text.
+// **SVG glyphs** (`stbtt_GetGlyphSVG`) are colour-emoji documents, not outlines.
+
+// Why a font could not be read, or a question about it could not be answered.
+enum FontError derives Eq
+    // The bytes start with neither a font's version tag nor a collection's.
+    NotAFont
+
+    // The bytes start like a font but are broken in a way stb would have read past or asserted on.
+    // The string says what was found.
+    Malformed(why: string)
+
+    // A collection was asked for a font it does not hold.
+    NoSuchFont(index: int, count: int)
+
+    // A glyph index outside the font. `count` is how many glyphs it has; indices run `0..<count`.
+    NoSuchGlyph(index: int, count: int)
+
+    // A caller's argument that cannot mean anything: a tolerance that is not positive, a size that
+    // is not finite. The string names it.
+    Invalid(why: string)
+
+    // The bytes are longer than stb can be told about. Every length in its API is an `int`.
+    TooLarge
+
+    // The machine ran out of memory copying the font.
+    NoMemory
+
+    // What went wrong, as a sentence.
+    message(self) -> string = self match
+        NotAFont                 -> "the bytes are not a font or a font collection"
+        Malformed(why)           -> "the font is malformed: " + why
+        NoSuchFont(index, count) -> f"there is no font ${index}%d — the collection holds ${count}%d"
+        NoSuchGlyph(index, count) -> f"there is no glyph ${index}%d — the font has ${count}%d"
+        Invalid(why)             -> why
+        TooLarge                 -> "the font is larger than stb can be told about"
+        NoMemory                 -> "out of memory"
+end FontError
+
+impl Display for FontError
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+
+// Which kind of outline a font carries. It decides which way round its contours wind.
+//
+// - `TrueType` (a `glyf` table) draws an outer contour **clockwise** and a hole anticlockwise, with
+//   y up.
+// - `Cff` (a `CFF ` table, an `.otf`) draws them the other way: outer **anticlockwise**, hole
+//   clockwise.
+//
+// Both formats specify the **non-zero** fill rule, and non-zero gives the right answer for either
+// direction, which is why it is the rule to fill with. Even-odd agrees on a well-made glyph but
+// differs wherever two contours overlap -- common in fonts cut from variable masters -- and a rule that
+// needs a particular direction (Manifold's `Positive`, say) is right for one kind and empty for the
+// other. `signed_area` says which way a contour turns.
+enum Outlines
+    TrueType
+    Cff
+
+// A font's vertical metrics, in font units: how far above the baseline it reaches, how far below
+// (negative), and the extra gap between one line's descent and the next line's ascent.
+struct VMetrics derives Eq
+    ascent: int
+    descent: int
+    line_gap: int
+
+    // The distance from one baseline to the next.
+    line_height(self) -> int = self.ascent - self.descent + self.line_gap
+
+// A glyph's horizontal metrics, in font units: how far the pen moves after it, and how far its
+// left edge sits right of the pen.
+struct HMetrics derives Eq
+    advance: int
+    left_side_bearing: int
+
+// A box in font units, corners included, y up.
+struct Box derives Eq
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+// One pair of the legacy `kern` table: glyph `left` followed by glyph `right` moves the pen by
+// `advance` more.
+struct KernPair derives Eq
+    left: int
+    right: int
+    advance: int
+
+// One step of a glyph's outline, in font units with y up. Every contour opens with a `MoveTo` and
+// ends back at that point, and contours are in the font's own order and direction.
+//
+// TrueType outlines are lines and quadratics; CFF outlines are lines and cubics.
+enum PathCommand derives Eq
+    MoveTo(x: int, y: int)
+    LineTo(x: int, y: int)
+    QuadTo(cx: int, cy: int, x: int, y: int)
+    CubicTo(c1x: int, c1y: int, c2x: int, c2y: int, x: int, y: int)
+
+// A point of a flattened outline.
+struct Point derives Eq
+    x: f64
+    y: f64
+
+// One glyph placed by `layout`: which glyph, and where its origin sits, in the units `layout` was
+// asked for, y up, the first baseline at 0.
+struct Placed derives Eq
+    glyph: int
+    x: f64
+    y: f64
+
+// What `text_outline` answers: every contour of every glyph in one coordinate space, and how much
+// room the text takes.
+struct TextOutline
+    contours: Buf[Buf[Point]]
+
+    // The widest line's advance -- where the pen ended, not where the ink did.
+    width: f64
+
+    // How many lines the text had: one more than its newlines.
+    lines: int
+
+// ## Collections
+
+// How many fonts the bytes hold: 1 for a plain font, the count for a collection, 0 for neither.
+font_count(data: []const u8) -> int
+    if is_font_tag(data, 0) then return 1
+    collection_count(data) match
+        Some(n) -> int(c.number_of_fonts(as_ptr(data)))
+        None    -> 0
+
+// Where font `index` starts in the bytes, which is 0 for a plain font.
+font_offset(data: []const u8, index: int) -> Result[int, FontError]
+    val count = font_count(data)
+    if count == 0 then return Err(NotAFont)
+    if index < 0 || index >= count then return Err(NoSuchFont(index, count))
+    Ok(c.font_offset(as_ptr(data), index))
+
+// ## Loading
+
+// A font stb can answer questions about, holding its own copy of the bytes. Made by `load_font`.
+struct Font
+    private[truetype] info: *c.FontInfo
+
+    // Why each glyph cannot be drawn, or "" -- see `check_glyf`. Empty for a CFF font.
+    private undrawable: Buf[string]
+
+    // How many glyphs the font has. Glyph indices run `0..<glyph_count`; 0 is `.notdef`.
+    glyph_count: int
+
+    // How many font units make an em.
+    units_per_em: int
+
+    outlines: Outlines
+
+    // The scale that makes ascent minus descent `pixels` tall -- the usual meaning of "a 12 pixel
+    // font".
+    scale_for_pixel_height(self, pixels: f64) -> f64 = f64(c.scale_for_pixel_height(self.info, f32(pixels)))
+
+    // The scale that makes one em `pixels` tall -- the meaning of a point size.
+    scale_for_em(self, pixels: f64) -> f64 = f64(c.scale_for_em(self.info, f32(pixels)))
+
+    // `hhea`'s ascent, descent and line gap.
+    vmetrics(self) -> VMetrics
+        var a = 0
+        var d = 0
+        var g = 0
+        c.vmetrics(self.info, &a, &d, &g)
+        VMetrics(a, d, g)
+
+    // `OS/2`'s typographic ascent, descent and line gap, which a font may set differently from
+    // `hhea`'s, or `None` where it has no `OS/2` table.
+    typo_vmetrics(self) -> Option[VMetrics]
+        var a = 0
+        var d = 0
+        var g = 0
+        if c.vmetrics_os2(self.info, &a, &d, &g) == 0 then None else Some(VMetrics(a, d, g))
+
+    // The box around every glyph, from `head`.
+    bounding_box(self) -> Box
+        var b = Box(0, 0, 0, 0)
+        c.font_box(self.info, &b.x0, &b.y0, &b.x1, &b.y1)
+        b
+
+    // The glyph a character maps to, or 0 -- `.notdef` -- when the font has none for it.
+    glyph(self, ch: char) -> int
+        val g = c.find_glyph(self.info, int(ch))
+        // A cmap may name a glyph past the end of the font. Treated as missing, since no other
+        // call can be handed it.
+        if g < 0 || g >= self.glyph_count then 0 else g
+
+    private checked(self, glyph: int) -> Result[int, FontError] =
+        if glyph < 0 || glyph >= self.glyph_count then Err(NoSuchGlyph(glyph, self.glyph_count)) else Ok(glyph)
+
+    // A glyph index that is in range and whose outline stb can read without leaving it. Everything
+    // that reads `glyf` goes through this; metrics and kerning do not read it.
+    private drawable(self, glyph: int) -> Result[int, FontError]
+        val g = self.checked(glyph)?
+        if self.undrawable.len() > 0 && self.undrawable[usize(g)] != "" then
+            return Err(Malformed(f"glyph ${g}%d cannot be drawn: " + self.undrawable[usize(g)]))
+        Ok(g)
+
+    // Whether stb can draw a glyph. A font that loaded can still hold a glyph broken inside itself;
+    // every outline and box of that glyph is refused with `Malformed`, and nothing else
+    // about the font is affected.
+    can_draw(self, glyph: int) -> bool = self.drawable(glyph).is_ok()
+
+    // A glyph's advance and left side bearing.
+    hmetrics(self, glyph: int) -> Result[HMetrics, FontError]
+        val g = self.checked(glyph)?
+        var advance = 0
+        var lsb = 0
+        c.glyph_hmetrics(self.info, g, &advance, &lsb)
+        Ok(HMetrics(advance, lsb))
+
+    // How much further apart `left` followed by `right` should sit than their advances say, usually
+    // negative. stb reads GPOS where the font has it and the legacy `kern` table otherwise; see the
+    // README for what its GPOS reading leaves out.
+    kern(self, left: int, right: int) -> Result[int, FontError] =
+        Ok(c.glyph_kern(self.info, self.checked(left)?, self.checked(right)?))
+
+    // The same, by character. A character the font lacks kerns as `.notdef` does. (A kerning lookup
+    // only compares glyph numbers, so this is safe even for a cmap entry past the font's end.)
+    kern_chars(self, left: char, right: char) -> int =
+        c.codepoint_kern(self.info, int(left), int(right))
+
+    // Every pair of the legacy `kern` table, in the table's order. GPOS kerning is not listed --
+    // it is classes and coverage rather than pairs -- so a font with only GPOS answers none.
+    kerning_table(self) -> Buf[KernPair]
+        val n = c.kerning_table_length(self.info)
+        var raw: Buf[c.KerningEntry] = buf()
+        for _ in 0..<n do raw.push(c.KerningEntry(0, 0, 0))
+        val got = if n > 0 then c.kerning_table(self.info, as_mut_ptr(raw.view()), n) else 0
+
+        var pairs: Buf[KernPair] = buf()
+        for e in raw.view()[0..<usize(got)] do pairs.push(KernPair(e.glyph1, e.glyph2, e.advance))
+        pairs
+
+    // A glyph's box, or `None` for a glyph with no outline -- a space.
+    //
+    // stb answers "no box" for an empty TrueType glyph but an all-zero box for an empty CFF one, so
+    // emptiness is asked separately, and both kinds of font answer the same way.
+    glyph_box(self, glyph: int) -> Result[Option[Box], FontError]
+        val g = self.drawable(glyph)?
+        if c.is_glyph_empty(self.info, g) != 0 then return Ok(None)
+        var b = Box(0, 0, 0, 0)
+        if c.glyph_box(self.info, g, &b.x0, &b.y0, &b.x1, &b.y1) == 0 then Ok(None) else Ok(Some(b))
+
+    // Whether a glyph has no outline at all.
+    is_empty(self, glyph: int) -> Result[bool, FontError] =
+        Ok(c.is_glyph_empty(self.info, self.drawable(glyph)?) != 0)
+
+    // A glyph's outline, in font units, as the font draws it.
+    shape(self, glyph: int) -> Result[Buf[PathCommand], FontError]
+        val g = self.drawable(glyph)?
+        var v: *c.Vertex = null
+        val n = c.glyph_shape(self.info, g, &v)
+
+        var cmds: Buf[PathCommand] = buf()
+        if n <= 0 then return Ok(cmds)
+
+        for x in v[0..<usize(n)]
+            val x0 = int(x.x)
+            val y0 = int(x.y)
+            cmds.push(x.kind match
+                c.VMOVE  -> MoveTo(x0, y0)
+                c.VLINE  -> LineTo(x0, y0)
+                c.VCURVE -> QuadTo(int(x.cx), int(x.cy), x0, y0)
+                _        -> CubicTo(int(x.cx), int(x.cy), int(x.cx1), int(x.cy1), x0, y0))
+
+        c.free_shape(self.info, v)
+        Ok(cmds)
+
+    // A glyph's outline flattened into closed polygons: one per contour, in the font's order and
+    // direction, the closing point not repeated. Points are font units times `scale`; `tolerance`
+    // is the furthest a flattened edge may stray from the true curve, in those same output units.
+    outline(self, glyph: int, tolerance: f64, scale: f64 = 1.0) -> Result[Buf[Buf[Point]], FontError]
+        check_flattening(tolerance, scale)?
+        var out: Buf[Buf[Point]] = buf()
+        flatten(self.shape(glyph)?.view(), tolerance, scale, 0.0, 0.0, &out)
+        Ok(out)
+end Font
+
+// stb's record and the copy behind it go together.
+impl Drop for Font
+    drop(self)
+        c.close(self.info)
+
+// Reads a font, or font `index` of a collection. The bytes are checked, then copied; the `Font`
+// does not refer to `data` afterwards.
+load_font(data: []const u8, index: int = 0) -> Result[&Font, FontError]
+    if data.len > usize(2147483647) then return Err(TooLarge)
+
+    val start = font_offset(data, index)?
+    if start < 0 then return Err(NotAFont)
+
+    val found = check_font(data, usize(start))?
+
+    var status = 0
+    val info = c.open(as_ptr(data), int(data.len), start, &status)
+
+    if usize(info) == 0 then
+        return Err(if status == c.TT_NO_MEMORY then NoMemory else Malformed("stb would not read it"))
+
+    Ok(Font(info, found.undrawable, found.glyphs, found.units_per_em, if found.cff then Cff else TrueType))
+
+// ## Flattening
+
+// Twice the area a closed polygon encloses, signed: positive when it turns anticlockwise (y up),
+// negative clockwise. Halved, it is the area.
+signed_area(contour: []const Point) -> f64
+    var twice = 0.0
+    for i in 0..<contour.len
+        val a = contour[i]
+        val b = contour[(i + 1) % contour.len]
+        twice += a.x * b.y - b.x * a.y
+    twice / 2.0
+
+private check_flattening(tolerance: f64, scale: f64) -> Result[unit, FontError]
+    if !(tolerance > 0.0) || tolerance == f64.infinity then return Err(Invalid("the tolerance has to be a positive number"))
+    if !(scale > 0.0) || scale == f64.infinity then return Err(Invalid("the scale has to be a positive number"))
+    Ok(())
+
+// How many straight pieces a curve needs to stay within `tolerance` of itself. This is Wang's
+// bound: a degree-n Bézier whose control polygon's largest second difference is `m` strays at most
+// `n(n-1)/8 * m / k^2` from `k` equal pieces, so `k` is the square root of the rest.
+private pieces(degree_factor: f64, m: f64, tolerance: f64) -> int
+    val k = (degree_factor * m / tolerance).sqrt().ceil()
+    if k < 1.0 then 1 else if k > 4096.0 then 4096 else int(k)
+
+private length(x: f64, y: f64) -> f64 = (x * x + y * y).sqrt()
+
+// Appends `cmds`' contours to `out`, each point `p * scale + (dx, dy)`.
+private[truetype] flatten(cmds: []const PathCommand, tolerance: f64, scale: f64, dx: f64, dy: f64,
+                out: *Buf[Buf[Point]])
+    var cur: Buf[Point] = buf()
+    // Where the pen is. A segment with no contour open -- which a malformed font can produce --
+    // starts one here, as a rasteriser would.
+    var pen = Point(dx, dy)
+
+    val at = (x: int, y: int) -> Point(f64(x) * scale + dx, f64(y) * scale + dy)
+
+    for cmd in cmds
+        if cur.len() == 0 then cur.push(pen)
+        cmd match
+            MoveTo(x, y) ->
+                finish(cur, out)
+                cur = buf()
+                cur.push(at(x, y))
+            LineTo(x, y) -> cur.push(at(x, y))
+            QuadTo(cx, cy, x, y) ->
+                val p0 = cur[cur.len() - 1]
+                val p1 = at(cx, cy)
+                val p2 = at(x, y)
+                val n = pieces(0.25, length(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y), tolerance)
+                for i in 1..n
+                    val t = f64(i) / f64(n)
+                    val u = 1.0 - t
+                    cur.push(Point(u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x,
+                                   u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y))
+            CubicTo(c1x, c1y, c2x, c2y, x, y) ->
+                val p0 = cur[cur.len() - 1]
+                val p1 = at(c1x, c1y)
+                val p2 = at(c2x, c2y)
+                val p3 = at(x, y)
+                val m1 = length(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y)
+                val m2 = length(p1.x - 2.0 * p2.x + p3.x, p1.y - 2.0 * p2.y + p3.y)
+                val n = pieces(0.75, if m1 > m2 then m1 else m2, tolerance)
+                for i in 1..n
+                    val t = f64(i) / f64(n)
+                    val u = 1.0 - t
+                    cur.push(Point(u * u * u * p0.x + 3.0 * u * u * t * p1.x + 3.0 * u * t * t * p2.x + t * t * t * p3.x,
+                                   u * u * u * p0.y + 3.0 * u * u * t * p1.y + 3.0 * u * t * t * p2.y + t * t * t * p3.y))
+        pen = cur[cur.len() - 1]
+
+    finish(cur, out)
+
+// A contour is closed by its last point returning to its first, so that point is dropped; what is
+// left is kept if it still encloses something.
+private finish(cur: Buf[Point], out: *Buf[Buf[Point]])
+    var pts = cur
+    if pts.len() > 1 then
+        val a = pts[0]
+        val b = pts[pts.len() - 1]
+        if a.x == b.x && a.y == b.y then pts.pop()
+    if pts.len() >= 3 then out.push(pts)
+
+// ## Text
+
+// Places each character of `text` along a baseline: advances, plus kerning between neighbours, at
+// `size` pixels of ascent-minus-descent (`scale_for_pixel_height`), y up, the first baseline at 0.
+// A newline starts the next line one line height lower. A character the font lacks is placed as
+// `.notdef`, which is what a reader of the result would want to see rather than a silent gap.
+layout(font: &Font, text: string, size: f64) -> Result[Buf[Placed], FontError]
+    if !(size > 0.0) || size == f64.infinity then return Err(Invalid("the size has to be a positive number"))
+
+    val scale = font.scale_for_pixel_height(size)
+    val line = f64(font.vmetrics().line_height()) * scale
+
+    var placed: Buf[Placed] = buf()
+    var pen = 0
+    var y = 0.0
+    var prev: Option[int] = None
+
+    for ch in text.chars
+        if ch == '\n' then
+            pen = 0
+            y -= line
+            prev = None
+            continue
+
+        val g = font.glyph(ch)
+        prev match
+            Some(p) -> pen += font.kern(p, g)?
+            None -> ()
+
+        placed.push(Placed(g, f64(pen) * scale, y))
+        pen += font.hmetrics(g)?.advance
+        prev = Some(g)
+
+    Ok(placed)
+
+// The outline of a whole piece of text, every glyph flattened and placed by `layout` into one
+// coordinate space, y up, the first baseline at 0 and the text starting at x = 0.
+//
+// `flatness` is the furthest a flattened edge may stray from the true curve, as a fraction of
+// `size`: the default, 1/500, is a tenth of a millimetre on 5 cm lettering.
+text_outline(font: &Font, text: string, size: f64, flatness: f64 = 0.002) -> Result[TextOutline, FontError]
+    if !(flatness > 0.0) || flatness == f64.infinity then return Err(Invalid("the flatness has to be a positive number"))
+
+    val placed = layout(font, text, size)?
+    val scale = font.scale_for_pixel_height(size)
+    val tolerance = flatness * size
+
+    var out: Buf[Buf[Point]] = buf()
+    for p in placed.view()
+        flatten(font.shape(p.glyph)?.view(), tolerance, scale, p.x, p.y, &out)
+
+    // The width is the widest line's pen position, read back from the layout.
+    var width = 0.0
+    var lines = 1
+    var line_end = 0.0
+    var i = 0
+    for ch in text.chars
+        if ch == '\n' then
+            if line_end > width then width = line_end
+            line_end = 0.0
+            lines += 1
+            continue
+        val g = placed[i].glyph
+        line_end = placed[i].x + f64(font.hmetrics(g)?.advance) * scale
+        i += 1
+    if line_end > width then width = line_end
+
+    Ok(TextOutline(out, width, lines))

@@ -1,0 +1,655 @@
+module sh.sysl.stb.truetype
+
+import sysl.buf.{Buf, buf}
+
+// Everything stb_truetype will read, checked before stb is allowed to read it.
+//
+// stb is handed a pointer to a font and never its length. Every offset it finds inside the font --
+// a table's place in the directory, a glyph's place in `loca`, a subtable's place in `cmap` -- is
+// followed as written, and in four places a malformed font reaches an `assert` that ends the
+// program. stb's own header says not to use it on fonts you do not trust.
+//
+// So this file walks the same structure stb walks, in the same order, with the length in hand, and
+// refuses a font whose next step would leave the bytes or reach one of those asserts. What it
+// checks is exactly what the readers bound in this package follow:
+//
+// - the table directory, and that every table it lists lies inside the bytes;
+// - the fixed-size tables (`head`, `hhea`, `maxp`, `OS/2`) are long enough for the fields read;
+// - `hmtx` holds a metric for every glyph `maxp` counts;
+// - the `cmap` subtable stb will choose is a format stb reads, and every lookup it can make lands
+//   inside that subtable;
+// - for TrueType outlines, every glyph `loca` points at is inside `glyf`, every simple glyph's
+//   flags and coordinates are inside its own bytes, and every composite names its parts by
+//   offset (stb asserts on the other kind) and does not contain itself;
+// - for CFF outlines, every INDEX and DICT stb parses lies inside the `CFF ` table, and every glyph
+//   has a charstring and, in a CID font, a font dict;
+// - the legacy `kern` table and every GPOS pair-adjustment subtable stb searches.
+//
+// A font that passes can still draw nonsense -- a glyph's coordinates are whatever the bytes say
+// -- but nothing stb does with it reads outside the copy it was given.
+
+// Where a table is, relative to the start of the bytes.
+private[truetype] struct Table
+    at: usize
+    len: usize
+
+// What loading learned that the rest of the module needs.
+private[truetype] struct Checked
+    glyphs: int
+    units_per_em: int
+    cff: bool
+
+    // For each glyph, why stb could not draw it without reading past it, or "" where it can. Empty
+    // for a CFF font, whose every defect is refused whole.
+    undrawable: Buf[string]
+
+private bad(why: string) -> FontError = Malformed(why)
+
+// Whether `n` bytes starting at `at` lie inside something `len` long, without overflowing.
+private[truetype] fits(len: usize, at: usize, n: usize) -> bool = at <= len && n <= len - at
+
+private[truetype] u8_at(d: []const u8, at: usize) -> usize = usize(d[at])
+
+private[truetype] u16_at(d: []const u8, at: usize) -> usize = usize(d[at]) << 8 | usize(d[at + 1])
+
+private[truetype] u32_at(d: []const u8, at: usize) -> usize = u16_at(d, at) << 16 | u16_at(d, at + 2)
+
+private[truetype] i16_at(d: []const u8, at: usize) -> int
+    val v = int(u16_at(d, at))
+    if v >= 32768 then v - 65536 else v
+
+private tag_at(d: []const u8, at: usize, tag: string) -> bool
+    val t = tag.bytes
+    d[at] == t[0] && d[at + 1] == t[1] && d[at + 2] == t[2] && d[at + 3] == t[3]
+
+// The first directory entry with this tag, which is the one stb's `stbtt__find_table` answers.
+private find(d: []const u8, start: usize, tag: string) -> Option[Table]
+    val n = u16_at(d, start + 4)
+
+    for i in 0..<n
+        val r = start + 12 + 16 * i
+        if tag_at(d, r, tag) then return Some(Table(u32_at(d, r + 8), u32_at(d, r + 12)))
+
+    None
+
+// A table that has to be there, at least `min` bytes long.
+private need(d: []const u8, start: usize, tag: string, min: usize) -> Result[Table, FontError]
+    find(d, start, tag) match
+        None -> Err(bad("there is no '" + tag + "' table"))
+        Some(t) -> if t.len < min then Err(bad("the '" + tag + "' table is too short")) else Ok(t)
+
+// A table that may be absent, but is at least `min` bytes long where it is present.
+private may(d: []const u8, start: usize, tag: string, min: usize) -> Result[Option[Table], FontError]
+    find(d, start, tag) match
+        None -> Ok(None)
+        Some(t) -> if t.len < min then Err(bad("the '" + tag + "' table is too short")) else Ok(Some(t))
+
+// The sfnt version tags stb recognises as a single font, which is `stbtt__isfont`.
+private[truetype] is_font_tag(d: []const u8, at: usize) -> bool =
+    fits(d.len, at, 4) && (
+        (d[at] == 0x31 && d[at + 1] == 0 && d[at + 2] == 0 && d[at + 3] == 0)
+        || tag_at(d, at, "typ1") || tag_at(d, at, "OTTO") || tag_at(d, at, "true")
+        || (d[at] == 0 && d[at + 1] == 1 && d[at + 2] == 0 && d[at + 3] == 0))
+
+// Whether the bytes start a collection stb reads: a `ttcf` tag, version 1 or 2, and room for the
+// offsets it claims.
+private[truetype] collection_count(d: []const u8) -> Option[usize]
+    if !fits(d.len, 0, 12) || !tag_at(d, 0, "ttcf") then return None
+
+    val version = u32_at(d, 4)
+    if version != 0x00010000 && version != 0x00020000 then return None
+
+    val n = u32_at(d, 8)
+    if n > 0x7fffffff || n > (d.len - 12) / 4 then None else Some(n)
+
+// The whole check, for the font whose table directory starts at `start`.
+private[truetype] check_font(d: []const u8, start: usize) -> Result[Checked, FontError]
+    if !fits(d.len, start, 12) then return Err(bad("the table directory is cut off"))
+    if !is_font_tag(d, start) then return Err(NotAFont)
+
+    val n = u16_at(d, start + 4)
+    if !fits(d.len, start + 12, 16 * n) then return Err(bad("the table directory is cut off"))
+
+    for i in 0..<n
+        val r = start + 12 + 16 * i
+        if !fits(d.len, u32_at(d, r + 8), u32_at(d, r + 12)) then
+            return Err(bad("a table runs past the end of the bytes"))
+
+    val head = need(d, start, "head", 54)?
+    val hhea = need(d, start, "hhea", 36)?
+    val maxp = need(d, start, "maxp", 6)?
+    val hmtx = need(d, start, "hmtx", 0)?
+    val cmap = need(d, start, "cmap", 4)?
+    may(d, start, "OS/2", 78)?
+
+    val glyphs = u16_at(d, maxp.at + 4)
+    if glyphs == 0 then return Err(bad("'maxp' counts no glyphs"))
+
+    val long_metrics = u16_at(d, hhea.at + 34)
+    if long_metrics == 0 || long_metrics > glyphs then
+        return Err(bad("'hhea' counts a number of metrics 'maxp' cannot agree with"))
+    if hmtx.len < 4 * long_metrics + 2 * (glyphs - long_metrics) then
+        return Err(bad("the 'hmtx' table is too short for the glyphs 'maxp' counts"))
+
+    check_cmap(d, cmap)?
+
+    var undrawable: Buf[string] = buf()
+    val glyf = find(d, start, "glyf")
+    val cff = glyf match
+        Some(g) ->
+            undrawable = check_glyf(d, head, need(d, start, "loca", 0)?, g, glyphs)?
+            false
+        None ->
+            val cff = find(d, start, "CFF ") match
+                Some(t) -> t
+                None -> return Err(bad("there are neither TrueType ('glyf') nor CFF ('CFF ') outlines"))
+            if cff.len < 4 then return Err(bad("the 'CFF ' table is too short"))
+            check_cff(d, cff, glyphs)?
+            true
+
+    may(d, start, "kern", 4)? match
+        Some(k) -> check_kern(d, k)?
+        None -> ()
+
+    may(d, start, "GPOS", 10)? match
+        Some(g) -> check_gpos(d, g)?
+        None -> ()
+
+    Ok(Checked(int(glyphs), int(u16_at(d, head.at + 18)), cff, undrawable))
+
+// ## cmap
+
+// The subtable stb settles on -- the LAST Unicode-capable record, since its loop does not stop at
+// the first -- and that every lookup in it lands inside it.
+private check_cmap(d: []const u8, cmap: Table) -> Result[unit, FontError]
+    val records = u16_at(d, cmap.at + 2)
+    if !fits(cmap.len, 4, 8 * records) then return Err(bad("the 'cmap' records are cut off"))
+
+    var chosen: Option[usize] = None
+
+    for i in 0..<records
+        val r = cmap.at + 4 + 8 * i
+        val platform = u16_at(d, r)
+        val encoding = u16_at(d, r + 2)
+        if platform == 0 || (platform == 3 && (encoding == 1 || encoding == 10)) then
+            chosen = Some(u32_at(d, r + 4))
+
+    val rel = chosen match
+        Some(o) -> o
+        None -> return Err(bad("there is no Unicode 'cmap' subtable"))
+
+    if !fits(cmap.len, rel, 4) then return Err(bad("the 'cmap' subtable is outside the table"))
+
+    val s = cmap.at + rel
+    val room = cmap.len - rel
+
+    u16_at(d, s) match
+        0 ->
+            val len = u16_at(d, s + 2)
+            if len < 6 || len > room then return Err(bad("the format 0 'cmap' subtable is cut off"))
+        6 ->
+            if room < 10 || !fits(room, 10, 2 * u16_at(d, s + 8)) then
+                return Err(bad("the format 6 'cmap' subtable is cut off"))
+        4 -> check_cmap4(d, s, room)?
+        12 | 13 ->
+            if room < 16 || !fits(room, 16, 12 * u32_at(d, s + 12)) then
+                return Err(bad("the 'cmap' groups are cut off"))
+        f -> return Err(bad(f"'cmap' subtable format ${f}%d is not one stb reads"))
+
+    Ok(())
+
+// Format 4, whose binary search is steered by three header fields stb trusts. They are held to the
+// values the specification derives from the segment count, which is what keeps the search inside
+// the end-code array, and every segment that reads through `idRangeOffset` is followed to its last
+// code point.
+private check_cmap4(d: []const u8, s: usize, room: usize) -> Result[unit, FontError]
+    if room < 14 then return Err(bad("the format 4 'cmap' header is cut off"))
+
+    val segs = u16_at(d, s + 6) >> 1
+    if segs == 0 || !fits(room, 16, 8 * segs) then
+        return Err(bad("the format 4 'cmap' segments are cut off"))
+
+    // stb starts at `rangeShift`, then steps by `searchRange` halved `entrySelector` times, and reads
+    // the segment it lands on from all four arrays. The furthest it can land is the sum of every
+    // step, which has to be a segment that exists. (Fonts in the wild do not always hold these
+    // fields to the values the specification derives, so the bound is checked, not the values.)
+    var furthest = u16_at(d, s + 12) >> 1
+    var step = u16_at(d, s + 8) >> 1
+    for _ in 0..<u16_at(d, s + 10)
+        step >>= 1
+        furthest += step
+    if furthest >= segs then
+        return Err(bad("the format 4 'cmap' search fields reach past its segments"))
+
+    for i in 0..<segs
+        val end = u16_at(d, s + 14 + 2 * i)
+        val first = u16_at(d, s + 16 + 2 * segs + 2 * i)
+        val range_at = 16 + 6 * segs + 2 * i
+        val range = u16_at(d, s + range_at)
+
+        if range != 0 && end >= first && !fits(room, range_at + range + 2 * (end - first), 2) then
+            return Err(bad("a format 4 'cmap' segment points outside the subtable"))
+
+    Ok(())
+
+// ## TrueType outlines
+
+// `loca` and `glyf` as a whole are structure, and a fault there refuses the font. A fault inside one
+// glyph only makes that glyph -- and any composite built from it -- undrawable: real fonts carry the
+// odd broken glyph (Times on macOS has one), and refusing the whole font for it would be worse than
+// refusing the glyph. The answer is each glyph's reason, "" for a sound one.
+private check_glyf(d: []const u8, head: Table, loca: Table, glyf: Table, glyphs: usize) -> Result[Buf[string], FontError]
+    val long = i16_at(d, head.at + 50) match
+        0 -> false
+        1 -> true
+        _ -> return Err(bad("'head' names an index format that is neither short nor long"))
+
+    val step: usize = if long then 4 else 2
+    if loca.len < step * (glyphs + 1) then return Err(bad("the 'loca' table is too short"))
+
+    val at = (i: usize) -> if long then u32_at(d, loca.at + 4 * i) else 2 * u16_at(d, loca.at + 2 * i)
+
+    // Each glyph's parts, so a composite that reaches itself can be found once all are read.
+    var parts: Buf[Buf[usize]] = buf()
+    var why: Buf[string] = buf()
+
+    for g in 0..<glyphs
+        val from = at(g)
+        val to = at(g + 1)
+        if to < from || to > glyf.len then return Err(bad("'loca' points outside 'glyf'"))
+
+        var mine: Buf[usize] = buf()
+        val verdict = if to > from then check_glyph(d[glyf.at + from..<glyf.at + to], glyphs, &mine) else Ok(())
+        why.push(verdict match
+            Ok(_) -> ""
+            Err(Malformed(w)) -> w
+            Err(e) -> e.message())
+        parts.push(mine)
+
+    spread(parts, &why)
+    Ok(why)
+
+// One glyph's bytes: its header, then either its contours or its components.
+private check_glyph(g: []const u8, glyphs: usize, parts: *Buf[usize]) -> Result[unit, FontError]
+    if g.len < 10 then return Err(bad("a glyph is shorter than its header"))
+
+    val contours = i16_at(g, 0)
+    if contours > 0 then check_simple(g, usize(contours)) else if contours < 0 then check_composite(g, glyphs, parts) else Ok(())
+
+// A simple glyph: the contour ends, the instructions, then three arrays whose lengths only the flags
+// say -- which is why they are walked here exactly as stb walks them.
+private check_simple(g: []const u8, contours: usize) -> Result[unit, FontError]
+    if !fits(g.len, 10, 2 * contours + 2) then return Err(bad("a glyph's contour ends are cut off"))
+
+    var last = 0
+    for c in 0..<contours
+        val end = u16_at(g, 10 + 2 * c)
+        if c > 0 && end <= last then return Err(bad("a glyph's contour ends do not increase"))
+        last = end
+
+    val n = last + 1
+    var p = 10 + 2 * contours
+    p += 2 + u16_at(g, p)
+    if p > g.len then return Err(bad("a glyph's instructions are cut off"))
+
+    var flags: Buf[u8] = buf()
+    while flags.len() < n
+        if p >= g.len then return Err(bad("a glyph's flags are cut off"))
+        val f = g[p]
+        p += 1
+        flags.push(f)
+        if f & 8 != 0 then
+            if p >= g.len then return Err(bad("a glyph's flags are cut off"))
+            val repeat = usize(g[p])
+            p += 1
+            for _ in 0..<repeat do flags.push(f)
+
+    // stb reads exactly `n` flags; a repeat that runs past them is harmless to it.
+    var bytes: usize = 0
+    for i in 0..<n
+        val f = flags[i]
+        bytes += if f & 2 != 0 then 1 else if f & 16 == 0 then 2 else 0
+        bytes += if f & 4 != 0 then 1 else if f & 32 == 0 then 2 else 0
+    if !fits(g.len, p, bytes) then return Err(bad("a glyph's coordinates are cut off"))
+
+    // A contour that starts on an off-curve point makes stb look at the point after it. Elsewhere
+    // that is the next contour's first point -- a strange outline, but inside the glyph -- and for a
+    // one-point last contour it is past what stb allocated.
+    val alone = if contours == 1 then last == 0 else u16_at(g, 10 + 2 * (contours - 2)) + 1 == last
+    if alone && flags[last] & 1 == 0 then
+        return Err(bad("its last contour is a single off-curve point"))
+
+    Ok(())
+
+// A composite: each component's flags, glyph and offsets, walked to the last. stb asserts on a
+// component positioned by matching points rather than by offset, so that kind is refused.
+private check_composite(g: []const u8, glyphs: usize, parts: *Buf[usize]) -> Result[unit, FontError]
+    var p = 10
+
+    loop
+        if !fits(g.len, p, 4) then return Err(bad("a composite glyph is cut off"))
+        val flags = u16_at(g, p)
+        val part = u16_at(g, p + 2)
+        p += 4
+
+        if flags & 2 == 0 then
+            return Err(bad("a composite glyph positions a part by matching points, which stb cannot do"))
+        if part < glyphs then parts.push(part)
+
+        p += if flags & 1 != 0 then 4 else 2
+        p += if flags & 8 != 0 then 2 else if flags & 64 != 0 then 4 else if flags & 128 != 0 then 8 else 0
+        if p > g.len then return Err(bad("a composite glyph is cut off"))
+
+        if flags & 32 == 0 then return Ok(())
+
+// stb draws a composite by drawing its parts, recursively and without a limit. So a composite that
+// contains itself -- directly or through others -- is a recursion that never ends, and a composite
+// built from an undrawable glyph is undrawable too. Both are marked in `why`.
+private spread(parts: Buf[Buf[usize]], why: *Buf[string])
+    // 0 unvisited, 1 on the current path, 2 finished
+    var state: Buf[u8] = buf()
+    for _ in 0..<parts.len() do state.push(0)
+
+    for root in 0..<parts.len()
+        if state[root] != 0 || parts[root].len() == 0 then continue
+
+        // An explicit stack of (glyph, next part to look at), so a deep font cannot exhaust ours.
+        var stack: Buf[(usize, usize)] = buf()
+        stack.push((root, 0))
+        state[root] = 1
+
+        while stack.len() > 0
+            val (g, next) = stack[stack.len() - 1]
+            if next < parts[g].len() then
+                stack[stack.len() - 1] = (g, next + 1)
+                val child = parts[g][next]
+                if state[child] == 1 && why[g] == "" then why[g] = "it contains itself"
+                if state[child] == 0 then
+                    state[child] = 1
+                    stack.push((child, 0))
+            else
+                // Every part is finished, so its verdict is final and can be inherited.
+                for child in parts[g].view()
+                    if why[child] != "" && why[g] == "" then why[g] = "it is built from a glyph that cannot be drawn"
+                state[g] = 2
+                stack.pop()
+
+// ## CFF outlines
+
+// An INDEX: where its elements' data begins, how many there are, and where the INDEX ends.
+private[truetype] struct Index
+    at: usize
+    count: usize
+    off_size: usize
+    data: usize
+    end: usize
+
+// The `i`th offset of an INDEX, which is 1-based into its data.
+private index_offset(t: []const u8, x: Index, i: usize) -> usize
+    var v = 0
+    for k in 0..<x.off_size do v = v << 8 | usize(t[x.at + 3 + i * x.off_size + k])
+    v
+
+private[truetype] index_at(t: []const u8, at: usize) -> Result[Index, FontError]
+    if !fits(t.len, at, 2) then return Err(bad("a CFF INDEX is cut off"))
+
+    val count = u16_at(t, at)
+    if count == 0 then return Ok(Index(at, 0, 1, at + 2, at + 2))
+
+    if !fits(t.len, at, 3) then return Err(bad("a CFF INDEX is cut off"))
+    val off_size = u8_at(t, at + 2)
+    if off_size < 1 || off_size > 4 then return Err(bad("a CFF INDEX has an impossible offset size"))
+    if !fits(t.len, at + 3, (count + 1) * off_size) then return Err(bad("a CFF INDEX is cut off"))
+
+    val x = Index(at, count, off_size, at + 3 + (count + 1) * off_size - 1, 0)
+
+    var prev = index_offset(t, x, 0)
+    if prev != 1 then return Err(bad("a CFF INDEX does not start its data at offset 1"))
+    for i in 1..count
+        val o = index_offset(t, x, i)
+        if o < prev then return Err(bad("a CFF INDEX's offsets go backwards"))
+        prev = o
+    if !fits(t.len, x.data, prev) then return Err(bad("a CFF INDEX's data runs past the table"))
+
+    Ok(Index(x.at, x.count, x.off_size, x.data, x.data + prev))
+
+private[truetype] element(t: []const u8, x: Index, i: usize) -> []const u8 =
+    t[x.data + index_offset(t, x, i)..<x.data + index_offset(t, x, i + 1)]
+
+// A DICT whose every operand stb's reader can step over and whose every integer operand it can
+// read: no reserved bytes, nothing running past the end.
+private check_dict(d: []const u8) -> Result[unit, FontError]
+    var p = 0
+    while p < d.len
+        val step: usize = d[p] match
+            12 -> 2
+            28 -> 3
+            29 -> 5
+            30 -> 0
+            31 | 255 -> return Err(bad("a CFF DICT holds a reserved byte"))
+            b -> if b < 28 || b <= 246 then 1 else 2
+
+        if step == 0 then
+            p += 1
+            loop
+                if p >= d.len then return Err(bad("a CFF DICT's number is cut off"))
+                val v = d[p]
+                p += 1
+                if v & 0xf == 0xf || v >> 4 == 0xf then break
+        else
+            if !fits(d.len, p, step) then return Err(bad("a CFF DICT is cut off"))
+            p += step
+
+    Ok(())
+
+// The integer operands of the first entry for `key`, as stb's `stbtt__dict_get_ints` reads them;
+// an empty list where the key is absent. A real operand where an integer is wanted is refused,
+// since stb asserts on it.
+private[truetype] dict_ints(d: []const u8, key: usize) -> Result[Buf[usize], FontError]
+    var p = 0
+    loop
+        if p >= d.len then return Ok(buf())
+
+        var ops: Buf[usize] = buf()
+        var real = false
+        while p < d.len && d[p] >= 28
+            val b = usize(d[p])
+            if b == 30 then
+                real = true
+                p += 1
+                while p < d.len
+                    val v = d[p]
+                    p += 1
+                    if v & 0xf == 0xf || v >> 4 == 0xf then break
+            else
+                // stb answers a `stbtt_uint32`, so a negative operand is its two's complement and
+                // the arithmetic here wraps as stb's does.
+                if b == 28 then
+                    ops.push(u16_at(d, p + 1))
+                    p += 3
+                else if b == 29 then
+                    ops.push(u32_at(d, p + 1))
+                    p += 5
+                else if b <= 246 then
+                    ops.push(b -% 139)
+                    p += 1
+                else if b <= 250 then
+                    ops.push((b - 247) * 256 + usize(d[p + 1]) + 108)
+                    p += 2
+                else
+                    ops.push(0 -% ((b - 251) * 256 + usize(d[p + 1]) + 108))
+                    p += 2
+
+        var op = if p < d.len then usize(d[p]) else 0
+        p += 1
+        if op == 12 then
+            op = 0x100 | (if p < d.len then usize(d[p]) else 0)
+            p += 1
+
+        if op == key then
+            if real then return Err(bad("a CFF DICT gives a real number where stb wants an integer"))
+            return Ok(ops)
+
+// A Private DICT -- `size` bytes at `at` -- and the local subroutines it names.
+private check_private(t: []const u8, size: usize, at: usize) -> Result[unit, FontError]
+    if size == 0 || at == 0 then return Ok(())
+    if !fits(t.len, at, size) then return Err(bad("a CFF Private DICT runs past the table"))
+
+    val p = t[at..<at + size]
+    check_dict(p)?
+
+    val subrs = dict_ints(p, 19)?
+    if subrs.len() > 0 && subrs[0] != 0 then index_at(t, at +% subrs[0])?
+
+    Ok(())
+
+private private_of(t: []const u8, dict: []const u8) -> Result[unit, FontError]
+    val loc = dict_ints(dict, 18)?
+    if loc.len() >= 2 then check_private(t, loc[0], loc[1]) else Ok(())
+
+private check_cff(d: []const u8, cff: Table, glyphs: usize) -> Result[unit, FontError]
+    val t = d[cff.at..<cff.at + cff.len]
+
+    val names = index_at(t, u8_at(t, 2))?
+    val tops = index_at(t, names.end)?
+    if tops.count == 0 then return Err(bad("the CFF table has no Top DICT"))
+    val strings = index_at(t, tops.end)?
+    index_at(t, strings.end)?
+
+    val top = element(t, tops, 0)
+    check_dict(top)?
+
+    val kind = dict_ints(top, 0x106)?
+    if kind.len() > 0 && kind[0] != 2 then return Err(bad("the CFF charstrings are not Type 2"))
+
+    val cs = dict_ints(top, 17)?
+    if cs.len() == 0 || cs[0] == 0 then return Err(bad("the CFF table names no charstrings"))
+    if index_at(t, cs[0])?.count < glyphs then return Err(bad("the CFF table has fewer charstrings than glyphs"))
+
+    private_of(t, top)?
+
+    val fdarray = dict_ints(top, 0x124)?
+    if fdarray.len() > 0 && fdarray[0] != 0 then
+        val fdselect = dict_ints(top, 0x125)?
+        if fdselect.len() == 0 || fdselect[0] == 0 then return Err(bad("a CID font has no FDSelect"))
+
+        val fds = index_at(t, fdarray[0])?
+        for i in 0..<fds.count
+            val fd = element(t, fds, i)
+            check_dict(fd)?
+            private_of(t, fd)?
+
+        check_fdselect(t, fdselect[0], glyphs, fds.count)?
+
+    Ok(())
+
+// Every glyph has to land on a font dict that exists: stb asserts on one that does not.
+private check_fdselect(t: []const u8, at: usize, glyphs: usize, dicts: usize) -> Result[unit, FontError]
+    if !fits(t.len, at, 1) then return Err(bad("the FDSelect is outside the CFF table"))
+
+    t[at] match
+        0 ->
+            if !fits(t.len, at + 1, glyphs) then return Err(bad("the FDSelect is cut off"))
+            for g in 0..<glyphs
+                if usize(t[at + 1 + g]) >= dicts then return Err(bad("the FDSelect names a font dict that is not there"))
+        3 ->
+            if !fits(t.len, at + 1, 4) then return Err(bad("the FDSelect is cut off"))
+            val ranges = u16_at(t, at + 1)
+            if !fits(t.len, at + 3, 3 * ranges + 2) then return Err(bad("the FDSelect is cut off"))
+            if ranges == 0 || u16_at(t, at + 3) != 0 then return Err(bad("the FDSelect does not start at glyph 0"))
+            for r in 0..<ranges
+                if usize(t[at + 5 + 3 * r]) >= dicts then return Err(bad("the FDSelect names a font dict that is not there"))
+            if u16_at(t, at + 3 + 3 * ranges) < glyphs then return Err(bad("the FDSelect does not cover every glyph"))
+        _ -> return Err(bad("the FDSelect is in a format stb does not read"))
+
+    Ok(())
+
+// ## Kerning
+
+// The first subtable of the legacy table, which is the only one stb reads, and only when it is the
+// horizontal format 0 stb expects.
+private check_kern(d: []const u8, k: Table) -> Result[unit, FontError]
+    if u16_at(d, k.at + 2) < 1 then return Ok(())
+    if k.len < 12 then return Err(bad("the 'kern' table is too short"))
+    if u16_at(d, k.at + 8) != 1 then return Ok(())
+    if !fits(k.len, 18, 6 * u16_at(d, k.at + 10)) then return Err(bad("the 'kern' pairs are cut off"))
+    Ok(())
+
+// A Coverage table at `at` inside a subtable `room` long, and the largest index it can answer.
+private coverage(d: []const u8, base: usize, at: usize, room: usize) -> Result[usize, FontError]
+    if !fits(room, at, 4) then return Err(bad("a GPOS coverage table is outside its subtable"))
+
+    val c = base + at
+    val n = u16_at(d, c + 2)
+    u16_at(d, c) match
+        1 ->
+            if !fits(room, at + 4, 2 * n) then return Err(bad("a GPOS coverage table is cut off"))
+            Ok(n)
+        2 ->
+            if !fits(room, at + 4, 6 * n) then return Err(bad("a GPOS coverage table is cut off"))
+            var most = 0
+            for i in 0..<n
+                val r = c + 4 + 6 * i
+                val first = u16_at(d, r)
+                val last = u16_at(d, r + 2)
+                if last >= first && u16_at(d, r + 4) + (last - first) + 1 > most then
+                    most = u16_at(d, r + 4) + (last - first) + 1
+            Ok(most)
+        _ -> Ok(0)
+
+private class_def(d: []const u8, base: usize, at: usize, room: usize) -> Result[unit, FontError]
+    if !fits(room, at, 4) then return Err(bad("a GPOS class table is outside its subtable"))
+
+    val c = base + at
+    val ok = u16_at(d, c) match
+        1 -> fits(room, at, 6) && fits(room, at + 6, 2 * u16_at(d, c + 4))
+        2 -> fits(room, at + 4, 6 * u16_at(d, c + 2))
+        _ -> true
+    if ok then Ok(()) else Err(bad("a GPOS class table is cut off"))
+
+// The pair-adjustment lookups stb searches, and every table they point at.
+private check_gpos(d: []const u8, g: Table) -> Result[unit, FontError]
+    if u16_at(d, g.at) != 1 || u16_at(d, g.at + 2) != 0 then return Ok(())
+
+    val list_at = u16_at(d, g.at + 8)
+    if !fits(g.len, list_at, 2) then return Err(bad("the GPOS lookup list is outside the table"))
+    val list = g.at + list_at
+    val lookups = u16_at(d, list)
+    if !fits(g.len, list_at + 2, 2 * lookups) then return Err(bad("the GPOS lookup list is cut off"))
+
+    for i in 0..<lookups
+        val l_at = list_at + u16_at(d, list + 2 + 2 * i)
+        if !fits(g.len, l_at, 6) then return Err(bad("a GPOS lookup is outside the table"))
+        val l = g.at + l_at
+        if u16_at(d, l) != 2 then continue
+
+        val subs = u16_at(d, l + 4)
+        if !fits(g.len, l_at + 6, 2 * subs) then return Err(bad("a GPOS lookup is cut off"))
+
+        for s in 0..<subs
+            val t_at = l_at + u16_at(d, l + 6 + 2 * s)
+            if !fits(g.len, t_at, 16) then return Err(bad("a GPOS pair subtable is outside the table"))
+            check_pair(d, g.at + t_at, g.len - t_at)?
+
+    Ok(())
+
+private check_pair(d: []const u8, t: usize, room: usize) -> Result[unit, FontError]
+    val covered = coverage(d, t, u16_at(d, t + 2), room)?
+    if u16_at(d, t + 4) != 4 || u16_at(d, t + 6) != 0 then return Ok(())
+
+    u16_at(d, t) match
+        1 ->
+            val sets = u16_at(d, t + 8)
+            if covered > sets || !fits(room, 10, 2 * covered) then return Err(bad("a GPOS pair subtable is cut off"))
+            for i in 0..<covered
+                val s_at = u16_at(d, t + 10 + 2 * i)
+                if !fits(room, s_at, 2) || !fits(room, s_at + 2, 4 * u16_at(d, t + s_at)) then
+                    return Err(bad("a GPOS pair set is cut off"))
+        2 ->
+            class_def(d, t, u16_at(d, t + 8), room)?
+            class_def(d, t, u16_at(d, t + 10), room)?
+            if u16_at(d, t + 12) * u16_at(d, t + 14) > (room - 16) / 2 then
+                return Err(bad("a GPOS class matrix is cut off"))
+        _ -> ()
+
+    Ok(())

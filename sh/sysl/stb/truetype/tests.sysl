@@ -1,0 +1,1048 @@
+module sh.sysl.stb.truetype
+@tests
+
+import sh.sysl.stb.c
+import sysl.buf.{Buf, buf}
+
+// The font binding's tests, run with `sysl test .`.
+//
+// ==The expected values are FreeType's and fontTools', never stb's==
+//
+// `fonts/oracle.txt` was written by `fonts/oracle.py`, which never calls stb: every glyph outline and
+// glyph box is **FreeType**'s (loaded unscaled and unhinted, so in font units), the cmap, metrics and
+// GPOS kerning are **fontTools**' reading of the tables, legacy `kern` pairs are FreeType's
+// `FT_Get_Kerning`, and every glyph's area is fontTools' `AreaPen`, which integrates the curves
+// exactly. A test that agrees with them is checking stb against two other implementations.
+//
+// The fixtures are Inter (SIL Open Font License, `fonts/OFL.txt`) cut down to printable ASCII by
+// `fonts/make_fixtures.py`: the same glyphs as TrueType (`.ttf`) and as CFF (`.otf`), a copy whose
+// kerning is a legacy `kern` table rather than GPOS, and a collection of the first two.
+
+val TTF  = embed("fonts/inter-ascii.ttf")
+val OTF  = embed("fonts/inter-ascii.otf")
+val KERN = embed("fonts/inter-ascii-kern.ttf")
+val TTC  = embed("fonts/inter-ascii.ttc")
+val ORACLE = embed("fonts/oracle.txt")
+
+// ## Reading the oracle
+
+struct Expected
+    glyphs: int
+    upem: int
+    vm: VMetrics
+    typo: VMetrics
+    bbox: Box
+    chars: Buf[ExpectedChar]
+    notdef_contours: int
+    notdef_box: Box
+    kern: Buf[(int, int, int)]
+    gpos: Buf[(int, int, int, int)]
+end Expected
+
+struct ExpectedChar
+    cp: int
+    glyph: int
+    advance: int
+    lsb: int
+    // `None` for a glyph with no outline.
+    box: Option[Box]
+    area: f64
+    contours: Buf[Buf[PathCommand]]
+end ExpectedChar
+
+is(w: []const u8, s: string) -> bool
+    val b = s.bytes
+    if w.len != b.len then return false
+    for i in 0..<w.len
+        if w[i] != b[i] then return false
+    true
+
+words(line: []const u8) -> Buf[[]const u8]
+    var out: Buf[[]const u8] = buf()
+    var i = 0
+    while i < line.len
+        if line[i] == u8(' ') then
+            i += 1
+            continue
+        val from = i
+        while i < line.len && line[i] != u8(' ')
+            i += 1
+        out.push(line[from..<i])
+    out
+
+lines(text: []const u8) -> Buf[Buf[[]const u8]]
+    var out: Buf[Buf[[]const u8]] = buf()
+    var from = 0
+    for i in 0..<text.len
+        if text[i] == u8('\n') then
+            out.push(words(text[from..<i]))
+            from = i + 1
+    out
+
+num(w: []const u8) -> int
+    var neg = false
+    var i = 0
+    if w[0] == u8('-') then
+        neg = true
+        i = 1
+    var v = 0
+    while i < w.len
+        v = v * 10 + int(w[i] - u8('0'))
+        i += 1
+    if neg then -v else v
+
+// A decimal with a fractional part, as `%.3f` writes one.
+dec(w: []const u8) -> f64
+    var neg = false
+    var i = 0
+    if w[0] == u8('-') then
+        neg = true
+        i = 1
+    var v = 0.0
+    var scale = 0.0
+    while i < w.len
+        if w[i] == u8('.') then
+            scale = 1.0
+        else
+            v = v * 10.0 + f64(w[i] - u8('0'))
+            scale *= 10.0
+        i += 1
+    if scale > 0.0 then v /= scale
+    if neg then -v else v
+
+box_at(w: Buf[[]const u8], i: usize) -> Box = Box(num(w[i]), num(w[i + 1]), num(w[i + 2]), num(w[i + 3]))
+
+// The commands of one `c` line: `c <segments> M x y <segments...>`.
+contour_at(w: Buf[[]const u8]) -> Buf[PathCommand]
+    var out: Buf[PathCommand] = buf()
+    var i = 2
+    while i < w.len()
+        val k = w[i]
+        if is(k, "M") then
+            out.push(MoveTo(num(w[i + 1]), num(w[i + 2])))
+            i += 3
+        else if is(k, "L") then
+            out.push(LineTo(num(w[i + 1]), num(w[i + 2])))
+            i += 3
+        else if is(k, "Q") then
+            out.push(QuadTo(num(w[i + 1]), num(w[i + 2]), num(w[i + 3]), num(w[i + 4])))
+            i += 5
+        else
+            out.push(CubicTo(num(w[i + 1]), num(w[i + 2]), num(w[i + 3]), num(w[i + 4]),
+                             num(w[i + 5]), num(w[i + 6])))
+            i += 7
+    out
+
+expected(name: string) -> Expected
+    val all = lines(ORACLE)
+    var e = Expected(0, 0, VMetrics(0, 0, 0), VMetrics(0, 0, 0), Box(0, 0, 0, 0), buf(), 0,
+                     Box(0, 0, 0, 0), buf(), buf())
+    var on = false
+
+    for w in all.view()
+        if w.len() == 0 then continue
+        val k = w[0]
+        if is(k, "font") then
+            on = is(w[1], name)
+        else if !on then
+            continue
+        else if is(k, "end") then
+            on = false
+        else if is(k, "upem") then
+            e.upem = num(w[1])
+        else if is(k, "glyphs") then
+            e.glyphs = num(w[1])
+        else if is(k, "vmetrics") then
+            e.vm = VMetrics(num(w[1]), num(w[2]), num(w[3]))
+        else if is(k, "typo") then
+            e.typo = VMetrics(num(w[1]), num(w[2]), num(w[3]))
+        else if is(k, "bbox") then
+            e.bbox = box_at(w, 1)
+        else if is(k, "cp") then
+            val empty = is(w[5], "empty")
+            e.chars.push(ExpectedChar(num(w[1]), num(w[2]), num(w[3]), num(w[4]),
+                                      if empty then None else Some(box_at(w, 5)),
+                                      if empty then 0.0 else dec(w[9]), buf()))
+        else if is(k, "c") then
+            e.chars[e.chars.len() - 1].contours.push(contour_at(w))
+        else if is(k, "notdef") then
+            e.notdef_contours = num(w[1])
+            e.notdef_box = box_at(w, 2)
+        else if is(k, "kern") then
+            e.kern.push((num(w[1]), num(w[2]), num(w[3])))
+        else if is(k, "gpos") then
+            e.gpos.push((num(w[1]), num(w[2]), num(w[3]), num(w[4])))
+    e
+
+// ## Comparing outlines
+
+end_of(cmd: PathCommand) -> (int, int) = cmd match
+    MoveTo(x, y) -> (x, y)
+    LineTo(x, y) -> (x, y)
+    QuadTo(_, _, x, y) -> (x, y)
+    CubicTo(_, _, _, _, x, y) -> (x, y)
+
+// Split at each `MoveTo`, dropping lines that go nowhere: FreeType closes every contour with a line
+// back to its start, even one of length zero, and stb does not always.
+split(cmds: []const PathCommand) -> Buf[Buf[PathCommand]]
+    var out: Buf[Buf[PathCommand]] = buf()
+    var at = (0, 0)
+    for cmd in cmds
+        val nowhere = cmd match
+            MoveTo(_, _) ->
+                out.push(buf())
+                false
+            LineTo(x, y) -> (x, y) == at
+            _ -> false
+        if !nowhere then
+            out[out.len() - 1].push(cmd)
+            at = end_of(cmd)
+    out
+
+near(a: int, b: int) -> bool = a - b <= 1 && b - a <= 1
+
+// Within one font unit: an implied on-curve point between two quadratic controls is a midpoint,
+// which stb rounds down and FreeType rounds toward zero.
+same(a: PathCommand, b: PathCommand) -> bool = a match
+    MoveTo(x, y) -> b match
+        MoveTo(p, q) -> near(x, p) && near(y, q)
+        _ -> false
+    LineTo(x, y) -> b match
+        LineTo(p, q) -> near(x, p) && near(y, q)
+        _ -> false
+    QuadTo(cx, cy, x, y) -> b match
+        QuadTo(cp, cq, p, q) -> near(cx, cp) && near(cy, cq) && near(x, p) && near(y, q)
+        _ -> false
+    CubicTo(c1x, c1y, c2x, c2y, x, y) -> b match
+        CubicTo(d1x, d1y, d2x, d2y, p, q) ->
+            near(c1x, d1x) && near(c1y, d1y) && near(c2x, d2x) && near(c2y, d2y) && near(x, p) && near(y, q)
+        _ -> false
+
+// The same closed path, perhaps starting at a different point: the segments after the `MoveTo`
+// match under some rotation. A contour that begins on an off-curve point starts elsewhere in each.
+same_contour(a: []const PathCommand, b: []const PathCommand) -> bool
+    if a.len != b.len then return false
+    val n = a.len - 1
+    if n == 0 then return true
+    // Each path closes: its last segment ends where its `MoveTo` began.
+    if !same(MoveTo(end_of(a[n]).0, end_of(a[n]).1), a[0]) then return false
+    if !same(MoveTo(end_of(b[n]).0, end_of(b[n]).1), b[0]) then return false
+    for r in 0..<n
+        var all = true
+        for i in 0..<n
+            if !same(a[1 + (i + r) % n], b[1 + i]) then
+                all = false
+                break
+        if all then return true
+    false
+
+// ## Collections
+
+@test("a plain font counts as one font, a collection as its count, and anything else as none")
+counts()
+    assert(font_count(TTF) == 1)
+    assert(font_count(OTF) == 1)
+    assert(font_count(TTC) == 2)
+    assert(font_count([]) == 0)
+    assert(font_count("not a font at all".bytes) == 0)
+    // A collection header claiming more offsets than the bytes hold is no collection.
+    assert(font_count(TTC[0..<16]) == 0)
+
+@test("a collection's fonts start where its header says, as fontTools reads it")
+offsets() -> Result[unit, FontError]
+    val all = lines(ORACLE)
+    var want: Buf[int] = buf()
+    for w in all.view()
+        if w.len() > 0 && is(w[0], "ttc") then
+            for i in 0..<usize(num(w[1])) do want.push(num(w[2 + i]))
+    assert(want.len() == 2)
+    assert(font_offset(TTC, 0)? == want[0])
+    assert(font_offset(TTC, 1)? == want[1])
+    assert(font_offset(TTF, 0)? == 0)
+    Ok(())
+
+@test("a collection refuses an index it does not hold, either side")
+offsets_out_of_range()
+    assert(font_offset(TTC, 2) == Err(NoSuchFont(2, 2)))
+    assert(font_offset(TTC, -1) == Err(NoSuchFont(-1, 2)))
+    assert(font_offset(TTF, 1) == Err(NoSuchFont(1, 1)))
+    assert(font_offset("garbage, not a font".bytes, 0) == Err(NotAFont))
+
+@test("each font of a collection loads as the standalone font it was made from")
+collection_fonts() -> Result[unit, FontError]
+    val a = load_font(TTC, 0)?
+    val b = load_font(TTC, 1)?
+    assert(a.glyph_count == expected("inter-ascii.ttf").glyphs)
+    assert(b.glyph_count == expected("inter-ascii.otf").glyphs)
+    assert(a.outlines == TrueType)
+    assert(b.outlines == Cff)
+    assert(a.hmetrics(a.glyph('W'))?.advance == b.hmetrics(b.glyph('W'))?.advance)
+    assert(load_font(TTC, 2) == Err(NoSuchFont(2, 2)))
+    Ok(())
+
+// ## Loading, and refusing
+
+@test("bytes that are not a font are refused as not a font")
+not_a_font()
+    assert(load_font([]) == Err(NotAFont))
+    assert(load_font("this is plainly some text".bytes) == Err(NotAFont))
+    var png: [16]u8 = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]
+    assert(load_font(png[..]) == Err(NotAFont))
+
+@test("a font's version tag with nothing behind it is refused as malformed, not read past")
+header_only()
+    assert(is_malformed(load_font(TTF[0..<4])))
+    assert(is_malformed(load_font(TTF[0..<12])))
+    // A directory that lists no tables has no `head`.
+    var empty: [12]u8 = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    assert(is_malformed(load_font(empty[..])))
+
+is_malformed(r: Result[&Font, FontError]) -> bool = r match
+    Err(Malformed(_)) -> true
+    _ -> false
+
+@test("a font cut short anywhere is refused, for TrueType, CFF and a collection's second font")
+truncated()
+    for data in [TTF, OTF, KERN]
+        val end = tables_end(data)
+        var cut = 0
+        while cut < end
+            assert(load_font(data[0..<cut]).is_err())
+            cut += 37
+        for cut in end - 8..<end do assert(load_font(data[0..<cut]).is_err())
+        // Cutting only the padding after the last table loses nothing a reader needs.
+        if end < data.len then exercise(load_font(data[0..<end]).unwrap())
+    var cut = 0
+    while cut < TTC.len
+        assert(load_font(TTC[0..<cut], 1).is_err())
+        cut += 101
+
+// Writes `v` big-endian at `at`.
+put16(b: *Buf[u8], at: usize, v: usize)
+    b[at] = u8(v >> 8 & 0xff)
+    b[at + 1] = u8(v & 0xff)
+
+copy(data: []const u8) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    b.extend(data)
+    b
+
+// The directory entry for `tag`: where its offset and length are written.
+entry(data: []const u8, tag: string) -> usize
+    val n = usize(data[4]) << 8 | usize(data[5])
+    val t = tag.bytes
+    for i in 0..<n
+        val r = 12 + 16 * i
+        if data[r] == t[0] && data[r + 1] == t[1] && data[r + 2] == t[2] && data[r + 3] == t[3] then return r
+    0
+
+// Where the last table ends: everything after it is padding.
+tables_end(data: []const u8) -> usize
+    val n = usize(data[4]) << 8 | usize(data[5])
+    var end: usize = 0
+    for i in 0..<n
+        val r = 12 + 16 * i
+        val at = usize(data[r + 8]) << 24 | usize(data[r + 9]) << 16 | usize(data[r + 10]) << 8 | usize(data[r + 11])
+        val len = usize(data[r + 12]) << 24 | usize(data[r + 13]) << 16 | usize(data[r + 14]) << 8 | usize(data[r + 15])
+        if at + len > end then end = at + len
+    end
+
+table_at(data: []const u8, tag: string) -> usize
+    val r = entry(data, tag)
+    usize(data[r + 8]) << 24 | usize(data[r + 9]) << 16 | usize(data[r + 10]) << 8 | usize(data[r + 11])
+
+@test("a table the directory places past the end is refused")
+table_past_end()
+    var b = copy(TTF)
+    val r = entry(TTF, "hmtx")
+    b[r + 12] = 0x7f
+    assert(is_malformed(load_font(b.view())))
+
+@test("a font missing a table stb needs is refused")
+missing_table()
+    for tag in ["head", "hhea", "hmtx", "maxp", "cmap", "loca"]
+        var b = copy(TTF)
+        b[entry(TTF, tag)] = u8('X')
+        assert(is_malformed(load_font(b.view())))
+    var b = copy(OTF)
+    b[entry(OTF, "CFF ")] = u8('X')
+    assert(is_malformed(load_font(b.view())))
+
+@test("loca pointing outside glyf is refused before stb follows it")
+loca_outside_glyf()
+    var b = copy(TTF)
+    val loca = table_at(TTF, "loca")
+    val head = table_at(TTF, "head")
+    val long = TTF[head + 51] == 1
+    // Glyph 1's end offset, made enormous.
+    if long then
+        put16(&b, loca + 8, 0x7fff)
+    else
+        put16(&b, loca + 4, 0xffff)
+    assert(is_malformed(load_font(b.view())))
+
+// Where glyph `g`'s bytes start in the TrueType fixture.
+glyph_at(data: []const u8, g: usize) -> usize
+    val loca = table_at(data, "loca")
+    val long = data[table_at(data, "head") + 51] == 1
+    val off = if long then
+        usize(data[loca + 4 * g]) << 24 | usize(data[loca + 4 * g + 1]) << 16 | usize(data[loca + 4 * g + 2]) << 8 | usize(data[loca + 4 * g + 3])
+    else
+        2 * (usize(data[loca + 2 * g]) << 8 | usize(data[loca + 2 * g + 1]))
+    table_at(data, "glyf") + off
+
+// A font whose one glyph is broken still loads; that glyph's outline is refused, and so is every
+// question that reads it, while its metrics and every other glyph are untouched.
+only_glyph_refused(f: &Font, g: int)
+    assert(!f.can_draw(g))
+    assert(f.shape(g) match
+        Err(Malformed(_)) -> true
+        _ -> false)
+    assert(f.outline(g, 1.0).is_err() && f.glyph_box(g).is_err() && f.is_empty(g).is_err())
+    assert(f.hmetrics(g).is_ok())
+    assert(f.can_draw(f.glyph('o')) && f.shape(f.glyph('o')).unwrap().len() > 0)
+
+@test("a composite glyph that contains itself cannot be drawn, since stb would recurse for ever")
+composite_cycle() -> Result[unit, FontError]
+    val g = load_font(TTF)?.glyph('i')
+    val at = glyph_at(TTF, usize(g))
+    // 'i' is a composite in this font: a negative contour count.
+    assert(TTF[at] == 0xff)
+    var b = copy(TTF)
+    put16(&b, at + 12, usize(g))
+    only_glyph_refused(load_font(b.view())?, g)
+    Ok(())
+
+@test("a composite part placed by matching points cannot be drawn, since stb asserts on it")
+composite_matching_points() -> Result[unit, FontError]
+    val g = load_font(TTF)?.glyph('i')
+    val at = glyph_at(TTF, usize(g))
+    var b = copy(TTF)
+    b[at + 11] = b[at + 11] & 0xfd
+    only_glyph_refused(load_font(b.view())?, g)
+    Ok(())
+
+@test("a simple glyph claiming more points than its bytes hold cannot be drawn, nor can a composite built from it")
+simple_too_many_points() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    val period = f.glyph('.')
+    val colon = f.glyph(':')
+    // ':' is two of '.' in this font.
+    assert(TTF[glyph_at(TTF, usize(colon))] == 0xff)
+    val at = glyph_at(TTF, usize(period))
+    val contours = usize(TTF[at]) << 8 | usize(TTF[at + 1])
+    var b = copy(TTF)
+    put16(&b, at + 10 + 2 * (contours - 1), 0xfff0)
+    val broken = load_font(b.view())?
+    only_glyph_refused(broken, period)
+    only_glyph_refused(broken, colon)
+    assert(text_outline(broken, "a:b", 10.0).is_err())
+    assert(text_outline(broken, "ab", 10.0).is_ok())
+    Ok(())
+
+@test("a last contour of one off-curve point cannot be drawn, since stb reads past it")
+lone_off_curve_point() -> Result[unit, FontError]
+    val g = load_font(TTF)?.glyph('b')
+    val at = glyph_at(TTF, usize(g))
+    val contours = usize(TTF[at]) << 8 | usize(TTF[at + 1])
+    assert(contours == 2)
+    val first_end = usize(TTF[at + 10]) << 8 | usize(TTF[at + 11])
+    // The second contour's end moved to one past the first's: a contour of one point. The flags
+    // after it are not read by anyone, so the glyph is otherwise intact.
+    var b = copy(TTF)
+    put16(&b, at + 10 + 2 * (contours - 1), first_end + 1)
+
+    // Whether that point is on or off the curve decides it, and the on-curve bit changes no
+    // coordinate's size, so it can be set either way.
+    val ins = usize(TTF[at + 10 + 2 * contours]) << 8 | usize(TTF[at + 11 + 2 * contours])
+    val flag = flag_at(TTF, at + 12 + 2 * contours + ins, first_end + 1)
+
+    b[flag] = b[flag] | 1
+    assert(load_font(b.view())?.can_draw(g))
+    b[flag] = b[flag] & 0xfe
+    only_glyph_refused(load_font(b.view())?, g)
+    Ok(())
+
+// Where the flag byte of point `i` is, reading the run-length flags that start at `at`.
+flag_at(data: []const u8, at: usize, i: usize) -> usize
+    var p = at
+    var n: usize = 0
+    loop
+        val f = data[p]
+        val count: usize = if f & 8 != 0 then 1 + usize(data[p + 1]) else 1
+        if i < n + count then return p
+        n += count
+        p += if f & 8 != 0 then 2 else 1
+
+@test("hhea counting more metrics than the font has glyphs is refused")
+too_many_metrics()
+    var b = copy(TTF)
+    put16(&b, table_at(TTF, "hhea") + 34, 5000)
+    assert(is_malformed(load_font(b.view())))
+
+@test("a cmap subtable in a format stb asserts on is refused rather than reached")
+cmap_format()
+    var b = copy(TTF)
+    val cmap = table_at(TTF, "cmap")
+    // Every subtable's format becomes 2, the one stb's lookup asserts on.
+    val n = usize(TTF[cmap + 2]) << 8 | usize(TTF[cmap + 3])
+    for i in 0..<n
+        val r = cmap + 4 + 8 * i
+        val off = usize(TTF[r + 4]) << 24 | usize(TTF[r + 5]) << 16 | usize(TTF[r + 6]) << 8 | usize(TTF[r + 7])
+        put16(&b, cmap + off, 2)
+    assert(is_malformed(load_font(b.view())))
+
+@test("an index format in head that is neither short nor long is refused")
+index_format()
+    var b = copy(TTF)
+    put16(&b, table_at(TTF, "head") + 50, 7)
+    assert(is_malformed(load_font(b.view())))
+
+@test("a CFF table whose charstrings INDEX is gone is refused")
+cff_no_charstrings()
+    var b = copy(OTF)
+    val cff = table_at(OTF, "CFF ")
+    // The name INDEX's count, made huge, sends every INDEX after it off the end of the table.
+    val hdr = usize(OTF[cff + 2])
+    put16(&b, cff + hdr, 0xfff0)
+    assert(is_malformed(load_font(b.view())))
+
+@test("a CFF charstrings INDEX whose data runs past the table is refused")
+cff_index_past_table() -> Result[unit, FontError]
+    val cff = table_at(OTF, "CFF ")
+    val t = OTF[cff..]
+    val names = index_at(t, usize(t[2]))?
+    val tops = index_at(t, names.end)?
+    val cs = dict_ints(element(t, tops, 0), 17)?[0]
+    val x = index_at(t, cs)?
+    assert(x.off_size >= 2)
+    // The last offset, the one that says where the data ends, made as large as it can be written.
+    var b = copy(OTF)
+    val last = cff + cs + 3 + x.count * x.off_size
+    for k in 0..<x.off_size do b[last + k] = 0xff
+    assert(is_malformed(load_font(b.view())))
+    Ok(())
+
+@test("a GPOS pair subtable whose coverage table is outside GPOS is refused")
+gpos_coverage_outside() -> Result[unit, FontError]
+    val gpos = table_at(TTF, "GPOS")
+    val list = gpos + (usize(TTF[gpos + 8]) << 8 | usize(TTF[gpos + 9]))
+    val lookups = usize(TTF[list]) << 8 | usize(TTF[list + 1])
+    var b = copy(TTF)
+    var hit = false
+    for i in 0..<lookups
+        val l = list + (usize(TTF[list + 2 + 2 * i]) << 8 | usize(TTF[list + 3 + 2 * i]))
+        if TTF[l + 1] == 2 && !hit then
+            val st = l + (usize(TTF[l + 6]) << 8 | usize(TTF[l + 7]))
+            put16(&b, st + 2, 0xfff0)
+            hit = true
+    assert(hit)
+    assert(is_malformed(load_font(b.view())))
+    Ok(())
+
+@test("a legacy kern table claiming more pairs than it holds is refused")
+kern_pairs_cut_off() -> Result[unit, FontError]
+    var b = copy(KERN)
+    put16(&b, table_at(KERN, "kern") + 10, 0xffff)
+    assert(is_malformed(load_font(b.view())))
+    Ok(())
+
+// Everything a font can be asked, for every glyph, so a mutation that got past the check is driven
+// through every reader stb has. Under AddressSanitizer this is what makes the check's claim
+// testable rather than asserted.
+exercise(f: &Font)
+    f.vmetrics()
+    f.typo_vmetrics()
+    f.bounding_box()
+    f.kerning_table()
+    f.scale_for_pixel_height(20.0)
+    for cp in 32..126 do f.glyph(char(cp))
+    for g in 0..<f.glyph_count
+        assert(f.hmetrics(g).is_ok())
+        assert(f.kern(g, (g * 7) % f.glyph_count).is_ok())
+        val draw = f.can_draw(g)
+        assert(f.glyph_box(g).is_ok() == draw)
+        assert(f.is_empty(g).is_ok() == draw)
+        assert(f.shape(g).is_ok() == draw)
+        assert(f.outline(g, 8.0).is_ok() == draw)
+    _ = f.kern_chars('A', 'V')
+
+@test("a font with bytes flipped at random either is refused or reads entirely inside itself")
+flipped_bytes()
+    var seed: u64 = 0x5eed
+    for data in [TTF, OTF]
+        var refused = 0
+        var loaded = 0
+        for _ in 0..<300
+            var b = copy(data)
+            for _ in 0..<4
+                seed = seed *% 6364136223846793005 +% 1442695040888963407
+                val at = usize(seed >> 33) % data.len
+                b[at] = u8(seed >> 24 & 0xff)
+            load_font(b.view()) match
+                Ok(f) ->
+                    exercise(f)
+                    loaded += 1
+                Err(_) -> refused += 1
+        // Both branches have to be taken, for each kind of font, for the test to mean anything.
+        assert(refused > 0 && loaded > 0)
+
+@test("the font owns its bytes: overwriting the slice it was loaded from changes nothing")
+owns_its_bytes() -> Result[unit, FontError]
+    var b = copy(TTF)
+    val f = load_font(b.view())?
+    val before = f.shape(f.glyph('g'))?
+    for i in 0..<b.len() do b[i] = 0
+    b.clear()
+    val after = f.shape(f.glyph('g'))?
+    assert(before.len() == after.len() && before.len() > 0)
+    for i in 0..<before.len() do assert(before[i] == after[i])
+    assert(f.hmetrics(f.glyph('g'))?.advance == expected("inter-ascii.ttf").chars[usize('g') - 32].advance)
+    Ok(())
+
+// ## Metrics
+
+check_font_metrics(data: []const u8, name: string) -> Result[unit, FontError]
+    val e = expected(name)
+    val f = load_font(data)?
+    assert(f.glyph_count == e.glyphs)
+    assert(f.units_per_em == e.upem)
+    assert(f.vmetrics() == e.vm)
+    assert(f.typo_vmetrics() == Some(e.typo))
+    assert(f.bounding_box() == e.bbox)
+    Ok(())
+
+@test("glyph count, units per em, vertical metrics and font box match fontTools, TrueType")
+metrics_ttf() -> Result[unit, FontError] = check_font_metrics(TTF, "inter-ascii.ttf")
+
+@test("glyph count, units per em, vertical metrics and font box match fontTools, CFF")
+metrics_otf() -> Result[unit, FontError] = check_font_metrics(OTF, "inter-ascii.otf")
+
+@test("the line height is ascent minus descent plus the gap")
+line_height() -> Result[unit, FontError]
+    val e = expected("inter-ascii.ttf")
+    assert(load_font(TTF)?.vmetrics().line_height() == e.vm.ascent - e.vm.descent + e.vm.line_gap)
+    Ok(())
+
+@test("a pixel-height scale fits ascent to descent in the pixels; an em scale fits the em")
+scales() -> Result[unit, FontError]
+    val e = expected("inter-ascii.ttf")
+    val f = load_font(TTF)?
+    val by_height = f.scale_for_pixel_height(24.0)
+    val by_em = f.scale_for_em(24.0)
+    assert((by_height * f64(e.vm.ascent - e.vm.descent) - 24.0).abs() < 1.0e-4)
+    assert((by_em * f64(e.upem) - 24.0).abs() < 1.0e-4)
+    assert(by_height != by_em)
+    Ok(())
+
+check_chars(data: []const u8, name: string) -> Result[unit, FontError]
+    val e = expected(name)
+    val f = load_font(data)?
+    assert(e.chars.len() == 95)
+    for x in e.chars.view()
+        val g = f.glyph(char(x.cp))
+        assert(g == x.glyph)
+        val h = f.hmetrics(g)?
+        assert(h.advance == x.advance)
+        assert(h.left_side_bearing == x.lsb)
+        assert(f.glyph_box(g)? == x.box)
+        assert(f.is_empty(g)? == (x.box == None))
+    Ok(())
+
+@test("every ASCII character maps to the glyph, advance, bearing and box FreeType and fontTools give, TrueType")
+chars_ttf() -> Result[unit, FontError] = check_chars(TTF, "inter-ascii.ttf")
+
+@test("every ASCII character maps to the glyph, advance, bearing and box FreeType and fontTools give, CFF")
+chars_otf() -> Result[unit, FontError] = check_chars(OTF, "inter-ascii.otf")
+
+@test("a character the font lacks maps to .notdef, glyph 0, which has metrics and an outline")
+missing_char() -> Result[unit, FontError]
+    val e = expected("inter-ascii.ttf")
+    val f = load_font(TTF)?
+    assert(f.glyph('é') == 0)
+    assert(f.glyph(char(0x1F600)) == 0)
+    assert(f.glyph(char(0)) == 0)
+    assert(f.hmetrics(0)?.advance > 0)
+    assert(f.glyph_box(0)? == Some(e.notdef_box))
+    assert(split(f.shape(0)?.view()).len() == usize(e.notdef_contours))
+    Ok(())
+
+@test("a cmap entry naming a glyph past the end of the font maps to .notdef")
+cmap_past_end() -> Result[unit, FontError]
+    // The fixture's one cmap subtable is format 4. The segment holding 'A' is given a delta that
+    // sends 'A' to glyph 60000; the font has 101.
+    val cmap = table_at(TTF, "cmap")
+    val sub = cmap + (usize(TTF[cmap + 8]) << 24 | usize(TTF[cmap + 9]) << 16 | usize(TTF[cmap + 10]) << 8 | usize(TTF[cmap + 11]))
+    assert(TTF[sub + 1] == 4)
+    val segs = (usize(TTF[sub + 6]) << 8 | usize(TTF[sub + 7])) / 2
+    var b = copy(TTF)
+    var hit = false
+    for i in 0..<segs
+        val end = usize(TTF[sub + 14 + 2 * i]) << 8 | usize(TTF[sub + 15 + 2 * i])
+        val first = usize(TTF[sub + 16 + 2 * segs + 2 * i]) << 8 | usize(TTF[sub + 17 + 2 * segs + 2 * i])
+        val range = usize(TTF[sub + 16 + 6 * segs + 2 * i]) << 8 | usize(TTF[sub + 17 + 6 * segs + 2 * i])
+        if first <= 0x41 && 0x41 <= end && range == 0 then
+            put16(&b, sub + 16 + 4 * segs + 2 * i, (60000 - 0x41) & 0xffff)
+            hit = true
+    assert(hit)
+    val f = load_font(b.view())?
+    assert(c.find_glyph(f.info, 0x41) == 60000)
+    assert(f.glyph('A') == 0)
+    Ok(())
+
+@test("every per-glyph question refuses an index past the end or below zero")
+glyph_out_of_range() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    val n = f.glyph_count
+    for g in [n, -1, 100000]
+        assert(f.hmetrics(g) == Err(NoSuchGlyph(g, n)))
+        assert(f.glyph_box(g) == Err(NoSuchGlyph(g, n)))
+        assert(f.is_empty(g) == Err(NoSuchGlyph(g, n)))
+        assert(f.shape(g).is_err())
+        assert(f.outline(g, 1.0).is_err())
+        assert(f.kern(g, 1) == Err(NoSuchGlyph(g, n)))
+        assert(f.kern(1, g) == Err(NoSuchGlyph(g, n)))
+    // The last glyph is in range.
+    assert(f.hmetrics(n - 1).is_ok())
+    Ok(())
+
+// ## Outlines
+
+check_shapes(data: []const u8, name: string) -> Result[unit, FontError]
+    val e = expected(name)
+    val f = load_font(data)?
+    var curves = 0
+    for x in e.chars.view()
+        val got = split(f.shape(x.glyph)?.view())
+        assert(got.len() == x.contours.len())
+        for i in 0..<got.len()
+            val want = split(x.contours[i].view())
+            assert(want.len() == 1)
+            assert(same_contour(got[i].view(), want[0].view()))
+            curves += got[i].len()
+    assert(curves > 1000)
+    Ok(())
+
+@test("every ASCII glyph's TrueType outline is FreeType's, segment for segment")
+shapes_ttf() -> Result[unit, FontError] = check_shapes(TTF, "inter-ascii.ttf")
+
+@test("every ASCII glyph's CFF outline is FreeType's, segment for segment")
+shapes_otf() -> Result[unit, FontError] = check_shapes(OTF, "inter-ascii.otf")
+
+@test("TrueType outlines are lines and quadratics; CFF outlines are lines and cubics")
+curve_kinds() -> Result[unit, FontError]
+    val tt = load_font(TTF)?
+    val cf = load_font(OTF)?
+    for cmd in tt.shape(tt.glyph('S'))?.view()
+        assert(cmd match
+            CubicTo(_, _, _, _, _, _) -> false
+            _ -> true)
+    var cubics = 0
+    for cmd in cf.shape(cf.glyph('S'))?.view()
+        cmd match
+            QuadTo(_, _, _, _) -> assert(false)
+            CubicTo(_, _, _, _, _, _) -> cubics += 1
+            _ -> ()
+    assert(cubics > 0)
+    Ok(())
+
+@test("a space has no outline and no box")
+space() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    val g = f.glyph(' ')
+    assert(f.shape(g)?.len() == 0)
+    assert(f.outline(g, 1.0)?.len() == 0)
+    assert(f.glyph_box(g)? == None)
+    assert(f.is_empty(g)?)
+    assert(!f.is_empty(f.glyph('A'))?)
+    Ok(())
+
+total_area(cs: Buf[Buf[Point]]) -> f64
+    var a = 0.0
+    for c in cs.view() do a += signed_area(c.view())
+    a
+
+check_areas(data: []const u8, name: string) -> Result[unit, FontError]
+    val e = expected(name)
+    val f = load_font(data)?
+    val tol = 0.5
+    for x in e.chars.view()
+        if x.box == None then continue
+        val cs = f.outline(x.glyph, tol)?
+        val got = total_area(cs)
+        // The sign is the font's winding; the size is fontTools' exact integral of the curves. No
+        // edge strays more than `tol` from the curve, so the area can differ by at most a strip
+        // `tol` wide along the outline -- and a correct flattening is well inside that.
+        assert(got * x.area > 0.0)
+        assert((got - x.area).abs() <= perimeter(cs) * tol)
+    Ok(())
+
+perimeter(cs: Buf[Buf[Point]]) -> f64
+    var p = 0.0
+    for c in cs.view()
+        for i in 0..<c.len()
+            val a = c[i]
+            val b = c[(i + 1) % c.len()]
+            p += ((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)).sqrt()
+    p
+
+@test("flattened TrueType glyphs enclose the area fontTools integrates, with its sign")
+areas_ttf() -> Result[unit, FontError] = check_areas(TTF, "inter-ascii.ttf")
+
+@test("flattened CFF glyphs enclose the area fontTools integrates, with its sign")
+areas_otf() -> Result[unit, FontError] = check_areas(OTF, "inter-ascii.otf")
+
+@test("an 'o' and an 'A' keep their holes: TrueType winds outer clockwise and holes anticlockwise, CFF the reverse")
+holes() -> Result[unit, FontError]
+    for data in [TTF, OTF]
+        val f = load_font(data)?
+        for ch in ['o', 'A']
+            val cs = f.outline(f.glyph(ch), 1.0)?
+            assert(cs.len() == 2)
+            val outer = signed_area(cs[0].view())
+            val hole = signed_area(cs[1].view())
+            assert(outer.abs() > hole.abs())
+            if f.outlines == TrueType then assert(outer < 0.0 && hole > 0.0) else assert(outer > 0.0 && hole < 0.0)
+    Ok(())
+
+@test("a tighter tolerance flattens into more points and lands closer to the exact area")
+tolerance_converges() -> Result[unit, FontError]
+    val e = expected("inter-ascii.otf")
+    val f = load_font(OTF)?
+    val x = e.chars[usize('S') - 32]
+    var last_points: usize = 0
+    var last_err = infinity
+    for tol in [16.0, 4.0, 1.0, 0.25]
+        val cs = f.outline(x.glyph, tol)?
+        var points: usize = 0
+        for c in cs.view() do points += c.len()
+        val err = (total_area(cs) - x.area).abs()
+        assert(points > last_points)
+        assert(err < last_err)
+        last_points = points
+        last_err = err
+    Ok(())
+
+@test("each flattened contour starts exactly at its MoveTo, scaled, and does not repeat it at the end")
+contour_starts() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    val g = f.glyph('O')
+    val shape = f.shape(g)?
+    val cs = f.outline(g, 0.01, 0.5)?
+    var starts: Buf[(f64, f64)] = buf()
+    for cmd in shape.view()
+        cmd match
+            MoveTo(x, y) -> starts.push((f64(x) * 0.5, f64(y) * 0.5))
+            _ -> ()
+    assert(cs.len() == starts.len())
+    for i in 0..<cs.len()
+        val (x, y) = starts[i]
+        assert(cs[i][0].x == x && cs[i][0].y == y)
+        // Closed implicitly: the point that returns to the start is not repeated.
+        assert(cs[i][cs[i].len() - 1] != cs[i][0])
+    Ok(())
+
+@test("a scale multiplies every point and an area by its square")
+outline_scale() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    val g = f.glyph('B')
+    val one = total_area(f.outline(g, 0.5)?)
+    val tenth = total_area(f.outline(g, 0.05, 0.1)?)
+    assert((tenth * 100.0 - one).abs() <= one.abs() * 0.001)
+    Ok(())
+
+@test("a tolerance or scale that is not a positive number is refused")
+bad_flattening() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    val g = f.glyph('a')
+    for t in [0.0, -1.0, nan, infinity]
+        assert(f.outline(g, t) match
+            Err(Invalid(_)) -> true
+            _ -> false)
+        assert(f.outline(g, 1.0, t) match
+            Err(Invalid(_)) -> true
+            _ -> false)
+    Ok(())
+
+@test("a path that draws before it moves starts at the origin, as stb's own reader does")
+draws_before_moving()
+    // A CFF charstring may draw with no moveto first, and a malformed one in the wild does; stb
+    // starts such a path at the glyph origin. Fuzzing found this.
+    val cmds = [LineTo(10, 0), QuadTo(10, 10, 0, 10), MoveTo(20, 0), LineTo(30, 0), LineTo(30, 10)]
+    var out: Buf[Buf[Point]] = buf()
+    flatten(cmds[..], 1.0, 2.0, 5.0, 0.0, &out)
+    assert(out.len() == 2)
+    assert(out[0][0] == Point(5.0, 0.0) && out[0][1] == Point(25.0, 0.0))
+    assert(out[0][out[0].len() - 1] == Point(5.0, 20.0))
+    assert(out[1].len() == 3 && out[1][0] == Point(45.0, 0.0))
+
+@test("signed area is positive anticlockwise and negative clockwise")
+signed_area_sign()
+    val ccw = [Point(0.0, 0.0), Point(2.0, 0.0), Point(2.0, 3.0), Point(0.0, 3.0)]
+    val cw = [Point(0.0, 0.0), Point(0.0, 3.0), Point(2.0, 3.0), Point(2.0, 0.0)]
+    assert(signed_area(ccw[..]) == 6.0)
+    assert(signed_area(cw[..]) == -6.0)
+    assert(signed_area([]) == 0.0)
+
+// ## Kerning
+
+@test("the legacy kern table's pairs are FreeType's, by table, by glyph and by character")
+kern_table() -> Result[unit, FontError]
+    val e = expected("inter-ascii-kern.ttf")
+    val f = load_font(KERN)?
+    assert(e.kern.len() > 100)
+    for k in e.kern.view()
+        val (a, b, v) = k
+        assert(f.kern_chars(char(a), char(b)) == v)
+        assert(f.kern(f.glyph(char(a)), f.glyph(char(b)))? == v)
+    // Every pair FreeType did not list is zero.
+    var nonzero = 0
+    for a in 32..126
+        for b in 32..126
+            if f.kern_chars(char(a), char(b)) != 0 then nonzero += 1
+    assert(nonzero == e.kern.len())
+    // The table as a list holds at least every pair FreeType saw, with its value.
+    val table = f.kerning_table()
+    assert(table.len() >= e.kern.len())
+    for k in e.kern.view()
+        val (a, b, v) = k
+        var found = false
+        for p in table.view()
+            if p.left == f.glyph(char(a)) && p.right == f.glyph(char(b)) then
+                assert(p.advance == v)
+                found = true
+        assert(found)
+    Ok(())
+
+@test("a font kerned only by GPOS lists no legacy pairs")
+gpos_lists_nothing() -> Result[unit, FontError]
+    assert(load_font(TTF)?.kerning_table().len() == 0)
+    Ok(())
+
+@test("GPOS kerning matches fontTools wherever only the lookups stb reads contribute")
+gpos_plain() -> Result[unit, FontError]
+    for data in [TTF, OTF]
+        val e = expected(if data.len == TTF.len then "inter-ascii.ttf" else "inter-ascii.otf")
+        val f = load_font(data)?
+        var checked = 0
+        for k in e.gpos.view()
+            val (a, b, full, plain) = k
+            assert(f.kern_chars(char(a), char(b)) == plain)
+            if full == plain then
+                assert(f.kern(f.glyph(char(a)), f.glyph(char(b)))? == full)
+                checked += 1
+        assert(checked > 100)
+    Ok(())
+
+@test(ignore: "stb_truetype reads no GPOS Extension lookups (type 9), and Inter keeps most of its kerning in one")
+gpos_full() -> Result[unit, FontError]
+    val e = expected("inter-ascii.ttf")
+    val f = load_font(TTF)?
+    for k in e.gpos.view()
+        val (a, b, full, _) = k
+        assert(f.kern_chars(char(a), char(b)) == full)
+    Ok(())
+
+// ## Text
+
+@test("layout advances by each glyph's width plus FreeType's kerning, and a newline drops a line")
+layout_positions() -> Result[unit, FontError]
+    val e = expected("inter-ascii-kern.ttf")
+    val f = load_font(KERN)?
+    val size = 32.0
+    val scale = f.scale_for_pixel_height(size)
+    val text = "AVATAR To\nWay"
+    val placed = layout(f, text, size)?
+    assert(placed.len() == 12)
+
+    var pen = 0
+    var prev = 0
+    var i = 0
+    var y = 0.0
+    for ch in text.chars
+        if ch == '\n' then
+            pen = 0
+            prev = 0
+            y = -f64(e.vm.ascent - e.vm.descent + e.vm.line_gap) * scale
+            continue
+        val cp = int(ch)
+        if prev != 0 then
+            for k in e.kern.view()
+                val (a, b, v) = k
+                if a == prev && b == cp then pen += v
+        assert(placed[i].glyph == e.chars[usize(cp - 32)].glyph)
+        assert((placed[i].x - f64(pen) * scale).abs() < 1.0e-9)
+        assert(placed[i].y == y)
+        pen += e.chars[usize(cp - 32)].advance
+        prev = cp
+        i += 1
+    // Kerning moved something, or this test would not tell kerned from unkerned.
+    assert(placed[1].x < f64(e.chars[usize('A') - 32].advance) * scale)
+    Ok(())
+
+@test("text_outline is every glyph's outline, moved to where layout put it")
+text_outline_places() -> Result[unit, FontError]
+    val f = load_font(KERN)?
+    val size = 20.0
+    val scale = f.scale_for_pixel_height(size)
+    val t = text_outline(f, "AV", size)?
+    val placed = layout(f, "AV", size)?
+    val a = f.outline(f.glyph('A'), 0.002 * size, scale)?
+    val v = f.outline(f.glyph('V'), 0.002 * size, scale)?
+    assert(t.contours.len() == a.len() + v.len())
+    for i in 0..<a.len()
+        for j in 0..<a[i].len() do assert(t.contours[i][j] == a[i][j])
+    for i in 0..<v.len()
+        for j in 0..<v[i].len()
+            val p = t.contours[a.len() + i][j]
+            assert((p.x - (v[i][j].x + placed[1].x)).abs() < 1.0e-9 && p.y == v[i][j].y)
+    assert(t.lines == 1)
+    assert((t.width - (placed[1].x + f64(f.hmetrics(f.glyph('V'))?.advance) * scale)).abs() < 1.0e-9)
+    Ok(())
+
+@test("text_outline measures its widest line and counts its lines, and an empty text has neither ink nor width")
+text_outline_lines() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    val one = text_outline(f, "Wide line", 10.0)?
+    val two = text_outline(f, "x\nWide line\n", 10.0)?
+    assert(two.lines == 3)
+    assert(two.width == one.width)
+    val none = text_outline(f, "", 10.0)?
+    assert(none.contours.len() == 0 && none.width == 0.0 && none.lines == 1)
+
+    // The second line's ink is the first's, one line height lower.
+    val stacked = text_outline(f, "o\no", 10.0)?
+    val drop = f64(f.vmetrics().line_height()) * f.scale_for_pixel_height(10.0)
+    assert(stacked.contours.len() == 4)
+    for i in 0..<2
+        val a = stacked.contours[i]
+        val b = stacked.contours[i + 2]
+        assert(a.len() == b.len())
+        for j in 0..<a.len() do assert(b[j].x == a[j].x && (b[j].y - (a[j].y - drop)).abs() < 1.0e-9)
+    Ok(())
+
+@test("text_outline refuses a size or flatness that is not a positive number")
+text_outline_bad() -> Result[unit, FontError]
+    val f = load_font(TTF)?
+    for bad in [0.0, -2.0, nan, infinity]
+        assert(text_outline(f, "a", bad).is_err())
+        assert(text_outline(f, "a", 10.0, bad).is_err())
+        assert(layout(f, "a", bad).is_err())
+    Ok(())
+
+// ## The raw layer
+
+@test("Vertex and KerningEntry are laid out as stb's structs are")
+layouts()
+    assert(sizeof(c.Vertex) == usize(c.VERTEX_SIZE))
+    assert(sizeof(c.KerningEntry) == usize(c.KERNING_SIZE))
+    assert(c.VMOVE == 1 && c.VLINE == 2 && c.VCURVE == 3 && c.VCUBIC == 4)
+
+@test("every error says what went wrong")
+messages()
+    assert(NotAFont.message().len > 0)
+    assert(f"${NoSuchGlyph(7, 3)}" == "there is no glyph 7 — the font has 3")
+    assert(f"${NoSuchFont(2, 1)}" == "there is no font 2 — the collection holds 1")
+    assert(Malformed("x").message() == "the font is malformed: x")
+    assert(Invalid("y").message() == "y")
+    assert(TooLarge.message().len > 0 && NoMemory.message().len > 0)
