@@ -277,7 +277,7 @@ struct Font
         val n = c.kerning_table_length(self.info)
         var raw: Buf[c.KerningEntry] = buf()
         for _ in 0..<n do raw.push(c.KerningEntry(0, 0, 0))
-        val got = if n > 0 then c.kerning_table(self.info, as_mut_ptr(raw.view()), n) else 0
+        val got = if n > 0 then c.kerning_table(self.info, as_mut_ptr(raw.view_mut()), n) else 0
 
         var pairs: Buf[KernPair] = buf()
         for e in raw.view()[0..<usize(got)] do pairs.push(KernPair(e.glyph1, e.glyph2, e.advance))
