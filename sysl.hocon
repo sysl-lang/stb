@@ -9,7 +9,7 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       stb { git = "github.com/sysl-lang/stb", version = "0.2.0" }
+//       stb { git = "github.com/sysl-lang/stb", version = "0.2.1" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
@@ -29,7 +29,7 @@
 
 package {
   name    = "stb"
-  version = "0.2.0"
+  version = "0.2.1"
 
   // **The oldest compiler this builds with.** The font module's checker wraps its arithmetic where
   // stb's does (`-%`, `+%`, from 0.8.0) and its tests read their fixtures with `embed`; 0.8.10 is

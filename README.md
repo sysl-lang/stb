@@ -63,7 +63,7 @@ thousand lines of vector code.
 
 ```hocon
 dependencies {
-  stb { git = "github.com/sysl-lang/stb", version = "0.2.0" }
+  stb { git = "github.com/sysl-lang/stb", version = "0.2.1" }
 }
 ```
 
